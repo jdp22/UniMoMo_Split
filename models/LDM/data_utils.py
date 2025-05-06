@@ -201,7 +201,7 @@ def validate_small_mol(mol, smiles, coords, expect_atom_num=None):
     mol_size = mol.GetNumAtoms()
     if expect_atom_num is not None:
         if mol_size < expect_atom_num - 5:
-            print_log(f'mol size {mol_size}, far below expectation {expect_atom_num}')
+            print_log(f'mol size {mol_size}, far below expectation {expect_atom_num}', level='DEBUG')
             return False # sometimes the model will converge to single blocks (like one indole)
     # validate bond length and angles. As we are predicting bonds by model,
     # there might be failed cases with many abnormal bond length and angles
