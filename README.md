@@ -153,8 +153,6 @@ tar zxvf $PREFIX/ProtFrag.tar.gz -C $PREFIX
 
 Processing:
 
-If you encounter errors when processing the LNR dataset, it might due to `6mlc.pdb`, which has unknown atoms with element type X. You need to manually remove these unknown atoms.
-
 ```bash
 python -m scripts.data_process.peptide.pepbench --index ${PREFIX}/LNR/test.txt --out_dir ${PREFIX}/LNR/processed --remove_het
 python -m scripts.data_process.peptide.pepbench --index ${PREFIX}/pepbench/all.txt --out_dir ${PREFIX}/pepbench/processed
