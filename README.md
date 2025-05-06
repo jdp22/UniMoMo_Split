@@ -187,11 +187,16 @@ python -m scripts.data_process.antibody.split --index ${PREFIX}/SAbDab/index.txt
 
 #### 3. Small Molecule
 
-Suppose all data are saved under `./datasets/molecule`. We set environment variable `export PREFIX=./datasets/molecule`. We use CrossedDocked dataset for training and testing on the task of small molecule design. Please refer to the [paper](https://github.com/luost26/3D-Generative-SBDD/blob/main/data/README.md) for the construction of the ML benchmark on CrossDocked2020. The original split only include the training and the test sets. Therefore, we additionally separate the last 100 complexes from the training set for validation.
+Suppose all data are saved under `./datasets/molecule`. We set environment variable `export PREFIX=./datasets/molecule`. We use CrossedDocked dataset for training and testing on the task of small molecule design. Please refer to the [paper](https://github.com/luost26/3D-Generative-SBDD/blob/main/data/README.md) for the construction of the ML benchmark on CrossDocked2020, which provides the compressed file and its split on the [google drive](https://drive.google.com/drive/folders/1CzwxmTpjbrt83z_wBzcQncq84OVDPurM). The original split only include the training and the test sets. Therefore, we additionally separate the last 100 complexes from the training set for validation.
+
+Suppose the two files are already downloaded:
+
+- Compressed data at `${PREFIX}/CrossDocked/crossdocked_pocket10.tar.gz`
+- Split file at `${PREFIX}/CrossDocked/split_by_name.pt`
 
 ```bash
 mkdir -p ${PREFIX}/CrossDocked
-tar zxvf ${PREFIX}/crossdocked_pocket10.tar.gz -C ${PREFIX}/CrossDocked
+tar zxvf ${PREFIX}/CrossDocked/crossdocked_pocket10.tar.gz -C ${PREFIX}/CrossDocked
 ```
 
 Processing:
