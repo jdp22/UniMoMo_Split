@@ -162,12 +162,18 @@ python -m scripts.data_process.peptide.pepbench --index ${PREFIX}/ProtFrag/all.t
 
 #### 2. Antibody
 
-Suppose all data are saved under `./datasets/antibody`. We set environment variable `export PREFIX=./datasets/antibody`. We use SAbDab downloaded at Sep 24th, 2024 for training, validation, and testing on antibody CDR design.
+Suppose all data are saved under `./datasets/antibody`. We set environment variable `export PREFIX=./datasets/antibody`. We use SAbDab downloaded at **Sep 24th, 2024** for training, validation, and testing on antibody CDR design.
+
+Download with the newest updates:
 
 ```bash
 mkdir -p ${PREFIX}/SAbDab
-wget https://opig.stats.ox.ac.uk/webapps/newsabdab/sabdab/archive/all/ -O ${PREFIX}/all_structures.zip
+# download the summary file
 wget https://opig.stats.ox.ac.uk/webapps/sabdab-sabpred/sabdab/summary/all/ -O ${PREFIX}/SAbDab/summary.csv
+# download the structure data
+wget https://opig.stats.ox.ac.uk/webapps/newsabdab/sabdab/archive/all/ -O ${PREFIX}/SAbDab/all_structures.zip
+# decompress the zip file
+unzip $PREFIX/SAbDab/all_structures.zip -d $PREFIX/SAbDab/
 ```
 
 Processing:
