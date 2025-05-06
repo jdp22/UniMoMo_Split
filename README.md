@@ -254,7 +254,6 @@ Please feel free to ask about any questions about the algorithms, codes, as well
     title={UniMoMo: Unified Generative Modeling of 3D Molecules for De Novo Binder Design},
     author={Kong, Xiangzhe and Zhang, Zishen and Zhang, Ziting and Jiao, Rui and Ma, Jianzhu and Liu, Kai and Huang, Wenbing and Liu, Yang},
     booktitle={Forty-second International Conference on Machine Learning},
-    year={2025},
-    url={https://openreview.net/forum?id=KUN7A7Okb6}
+    year={2025}
 }
 ```
