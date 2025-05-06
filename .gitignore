@@ -8,6 +8,10 @@ runs
 
 tmp
 
-env
+env*
 
 demo
+
+datasets
+
+checkpoints

@@ -124,11 +124,11 @@ CBGBench is used to evaluate designed small molecules comprehensively. Please fo
 
 ### Datasets
 
-**Suppose all the datasets are downloaded below `/path/to/data/`.**
+**Throughout the instructions, we suppose all the datasets are downloaded below `./datasets`.**
 
 #### 1. Peptide
 
-Suppose all data are saved under `/path/to/data/peptide`. We set environment variable `export PREFIX=/path/to/data/peptide`. The data for peptides includes the following datasets:
+Suppose all data are saved under `./datasets/peptide`. We set environment variable `export PREFIX=./datasets/peptide`. The data for peptides includes the following datasets:
 
 - LNR: The test set of 93 complexes.
 - PepBench: The training/validation dataset of about 6K complexes with the peptide length between 4 to 25.
@@ -137,6 +137,8 @@ Suppose all data are saved under `/path/to/data/peptide`. We set environment var
 Download:
 
 ```bash
+# create the folder
+mkdir -p $PREFIX
 # LNR
 wget https://zenodo.org/records/13373108/files/LNR.tar.gz?download=1 -O ${PREFIX}/LNR.tar.gz
 tar zxvf ${PREFIX}/LNR.tar.gz -C $PREFIX
@@ -162,10 +164,10 @@ python -m scripts.data_process.peptide.pepbench --index ${PREFIX}/ProtFrag/all.t
 
 #### 2. Antibody
 
-Suppose all data are saved under `/path/to/data/antibody`. We set environment variable `export PREFIX=/path/to/data/antibody`. We use SAbDab downloaded at Sep 24th, 2024 for training, validation, and testing on antibody CDR design.
+Suppose all data are saved under `./datasets/antibody`. We set environment variable `export PREFIX=./datasets/antibody`. We use SAbDab downloaded at Sep 24th, 2024 for training, validation, and testing on antibody CDR design.
 
 ```bash
-mkdir ${PREFIX}/SAbDab
+mkdir -p ${PREFIX}/SAbDab
 wget https://opig.stats.ox.ac.uk/webapps/newsabdab/sabdab/archive/all/ -O ${PREFIX}/all_structures.zip
 wget https://opig.stats.ox.ac.uk/webapps/sabdab-sabpred/sabdab/summary/all/ -O ${PREFIX}/SAbDab/summary.csv
 ```
@@ -181,10 +183,10 @@ python -m scripts.data_process.antibody.split --index ${PREFIX}/SAbDab/index.txt
 
 #### 3. Small Molecule
 
-Suppose all data are saved under `/path/to/data/molecule`. We set environment variable `export PREFIX=/path/to/data/molecule`. We use CrossedDocked dataset for training and testing on the task of small molecule design. Please refer to the [paper](https://github.com/luost26/3D-Generative-SBDD/blob/main/data/README.md) for the construction of the ML benchmark on CrossDocked2020. The original split only include the training and the test sets. Therefore, we additionally separate the last 100 complexes from the training set for validation.
+Suppose all data are saved under `./datasets/molecule`. We set environment variable `export PREFIX=./datasets/molecule`. We use CrossedDocked dataset for training and testing on the task of small molecule design. Please refer to the [paper](https://github.com/luost26/3D-Generative-SBDD/blob/main/data/README.md) for the construction of the ML benchmark on CrossDocked2020. The original split only include the training and the test sets. Therefore, we additionally separate the last 100 complexes from the training set for validation.
 
 ```bash
-mkdir ${PREFIX}/CrossDocked
+mkdir -p ${PREFIX}/CrossDocked
 tar zxvf ${PREFIX}/crossdocked_pocket10.tar.gz -C ${PREFIX}/CrossDocked
 ```
 
