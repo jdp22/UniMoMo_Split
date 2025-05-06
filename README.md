@@ -182,7 +182,7 @@ Processing:
 # process
 python -m scripts.data_process.antibody.sabdab --index ${PREFIX}/SAbDab/summary.csv --out_dir ${PREFIX}/SAbDab/processed
 # split
-python -m scripts.data_process.antibody.split --index ${PREFIX}/SAbDab/index.txt --rabd_summary ${PREFIX}/RAbD/rabd_summary.jsonl
+python -m scripts.data_process.antibody.split --index ${PREFIX}/SAbDab/processed/index.txt --rabd_summary ${PREFIX}/RAbD/rabd_summary.jsonl
 ```
 
 #### 3. Small Molecule
