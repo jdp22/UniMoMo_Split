@@ -42,12 +42,12 @@ conda activate UniMoMo
 
 ### Trained Weights
 
-We have uploaded the trained checkpoint at the [release page](https://github.com/THUNLP-MT/UniMoMo/releases/tag/v1.0). Please download it and put it under `./checkpoints/model.ckpt`.
+We have uploaded the trained checkpoint at the [release page](https://github.com/kxz18/UniMoMo/releases/tag/v1.0). Please download it and put it under `./checkpoints/model.ckpt`.
 
 ```bash
 mkdir checkpoints
 cd checkpoints
-wget https://github.com/THUNLP-MT/UniMoMo/releases/download/v1.0/model.ckpt
+wget https://github.com/kxz18/UniMoMo/releases/download/v1.0/model.ckpt
 ```
 
 ## :eyes: Usage
