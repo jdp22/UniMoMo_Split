@@ -1,9 +1,13 @@
 #!/bin/bash
 
-RESULTS_DIR=$1
+RESULTS_DIR=`realpath $1`
+echo "Evaluating results from $RESULTS_DIR"
 
 CBGBENCH_REPO=/path/to/CBGBench
 DATA_DIR=/path/to/CrossDocked/crossdocked_pocket10
+
+DATA_DIR=`realpath $DATA_DIR`
+echo "CrossDocked2020 located at $DATA_DIR"
 
 cd ${CBGBENCH_REPO}/evaluate_scripts
 
