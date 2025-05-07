@@ -22,14 +22,12 @@ from scipy.stats import spearmanr
 
 from data.bioparse.parser.pdb_to_complex import pdb_to_complex as pdb_to_complex_raw
 from data.bioparse import VOCAB, Block, const
-from data.bioparse.utils import extract_atom_coords, recur_index
+from data.bioparse.utils import recur_index
 from evaluation import diversity
 from evaluation.rmsd import compute_rmsd
 from evaluation.dockq import dockq
 from utils.random_seed import setup_seed
-from evaluation.seq import slide_aar, align_sequences
-from evaluation.seq import aar as strict_aar
-from evaluation.bsr import get_bind_ratio
+from evaluation.seq import align_sequences
 # from evaluation.openmm_relaxer import ForceFieldMinimizer
 # from evaluation.energy import pyrosetta_interface_energy
 from evaluation.clash import eval_pdb_clash
@@ -71,11 +69,11 @@ def _mean(vals):
 def subprocess_run_dG(pdb, rec_chains, lig_chains, relax, relax_first=None, relax_last=None, relax_save_pdb=None):
 
     args = {
-        'pdb_path': pdb,
+        'pdb_path': os.path.abspath(pdb),
         'receptor_chains': rec_chains,
         'ligand_chains': lig_chains,
         'relax': relax,
-        'relax_save_pdb': relax_save_pdb
+        'relax_save_pdb': None if relax_save_pdb is None else os.path.abspath(relax_save_pdb)
     }
     if relax_first is not None and relax_last is not None:
         args['relax_opt'] = {
@@ -190,17 +188,6 @@ def run_ref_metrics(task: Task):
     clash_inner, clash_outer = eval_pdb_clash(ref_pdb, task.target_chains_ids, task.ligand_chains_ids)
     task.ref_metrics['ref_Clash_inner'] = round(clash_inner, 4)
     task.ref_metrics['ref_Clash_outer'] = round(clash_outer, 4)
-
-    return task
-
-
-@ray.remote(num_cpus=1)
-def run_ref_relax(task: Task):
-
-    if task.is_antibody:
-        ref_pdb = _get_ref_pdb(os.path.dirname(task.id), task.root_dir)
-    else:
-        ref_pdb = _get_ref_pdb(task.id, task.root_dir)
 
     return task
 
@@ -330,7 +317,7 @@ def aggregate_metrics(tasks: List[Task]):
         if len(seqs) > 1:
             seq_div, struct_div, co_div, _ = diversity.diversity(seqs, np.array(ca_coords))
         else:
-            seq_div, struct_div, co_div, consistency = 0, 0, 0, 0
+            seq_div, struct_div, co_div = 0, 0, 0
         aggr_results['Sequence Diversity'] = round(seq_div, 3)
         aggr_results['Struct Diversity'] = round(struct_div, 3)
         aggr_results['Codesign Diversity'] = round(co_div, 3)
@@ -355,7 +342,6 @@ def pipeline_eval(input: Tuple[List[dict], bool]):
 
     ref_funcs = [
         run_ref_metrics,
-        run_ref_relax
     ]
     for fn in ref_funcs:
         ref_task = fn.remote(ref_task)
@@ -457,7 +443,10 @@ def main(args):
             if '>=' in name or '<=' in name:  # percentage
                 print_and_log(f'{name}: {sum(aggr_vals) / len(aggr_vals)}')
             else:
-                print_and_log(f'{name}: mean {sum(aggr_vals) / len(aggr_vals)}, median {statistics.median(aggr_vals)}')
+                if 'RMSD' in name:  # use median as conventions
+                    print_and_log(f'{name} (median): {statistics.median(aggr_vals)}')
+                else:
+                    print_and_log(f'{name} (mean): {sum(aggr_vals) / len(aggr_vals)}')
                 if len(not_nan_idx) == 0:
                     print_log('all values are nan!', level='WARN')
                     lowest_i, highest_i = 0, 0
@@ -485,10 +474,14 @@ def main(args):
             pdb = _get_gen_pdb(item['id'], item['n'], root_dir)
             pdbs.append(pdb)
             selected_residues.append(item['gen_block_idx'])
-    print_and_log('Dihedral angles for generation:')
+    print_and_log('JSD of dihedral angles:')
     dist = dihedral_distribution(pdbs, all_selected_residues=selected_residues, num_cpus=args.num_workers)
     profile = jsd_angle_profile(dist, 'antibody' if args.antibody else 'peptide')
-    for key in profile: print_and_log(f'{key}: {profile[key]}')
+    for key in profile:
+        if key not in ['backbone_overall', 'sidechain_overall']: print_and_log(f'{key}: {profile[key]}')
+    print_and_log('\n')
+    print_and_log(f'backbone_overall (JSD_bb): {profile["backbone_overall"]}')
+    print_and_log(f'sidechain_overall (JSD_sc): {profile["sidechain_overall"]}')
     print_and_log('\n')
 
     log_file.close()
