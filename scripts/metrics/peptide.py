@@ -174,15 +174,7 @@ def run_ref_metrics(task: Task):
         task.ligand_chains_ids,
         task.gen_block_idx if task.is_antibody else None,
         relax_save_pdb=ref_pdb.rstrip('.pdb') + '_rosetta.pdb')
-    task.ref_metrics['ref_dG_relax'] = round(ref_dG_relax, 2)
-
-    ref_dG = robust_dG(
-        ref_pdb, task.target_chains_ids,
-        task.ligand_chains_ids,
-        task.gen_block_idx if task.is_antibody else None,
-        n=1, relax=False
-    )
-    task.ref_metrics['ref_dG'] = round(ref_dG, 2)
+    task.ref_metrics['ref_dG'] = round(ref_dG_relax, 2)
 
     # ref clash
     clash_inner, clash_outer = eval_pdb_clash(ref_pdb, task.target_chains_ids, task.ligand_chains_ids)
