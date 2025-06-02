@@ -2,7 +2,6 @@
 
 ![cover](./assets/cover.png)
 
-
 ## :dna: Introduction
 
 This is the official repository for our paper [UniMoMo: Unified Generative Modeling of 3D Molecules for *De Novo* Binder Design](https://arxiv.org/pdf/2503.19300). We believe in one single all-atom generative models for designing all binders including small molecules, peptides, antibodies, and so on, since the physics underlying interactions and local geometries remain consistent. This is the starting point of the project which serves as a computational proof-of-concept. While the current form may still be a little bit simple for real-world applications, we are rigorously improving the framework through more data and functionalities. Thank you for your interest in our work!
@@ -10,17 +9,17 @@ This is the official repository for our paper [UniMoMo: Unified Generative Model
 ## :mag: Quick Links
 
 - [Setup](#rocket-setup)
-    - [Environment](#environment)
-    - [Trained Weights](#trained-weights)
+  - [Environment](#environment)
+  - [Trained Weights](#trained-weights)
 - [Usage](#eyes-usage)
-    - [Demo](#demo)
-    - [Tutorials](#tutorials)
+  - [Demo](#demo)
+  - [Tutorials](#tutorials)
 - [Reproduction of Paper Experiments](#page_facing_up-reproduction-of-paper-experiments)
-    - [Additional Dependencies](#additional-dependencies)
-    - [Datasets](#datasets)
-    - [Training](#training)
-    - [Inference](#inference)
-    - [Evaluation](#evaluation)
+  - [Additional Dependencies](#additional-dependencies)
+  - [Datasets](#datasets)
+  - [Training](#training)
+  - [Inference](#inference)
+  - [Evaluation](#evaluation)
 - [Contact](#bulb-contact)
 - [Reference](#reference)
 
@@ -64,7 +63,6 @@ python -m api.generate --config api/demo/config.yaml --ckpt checkpoints/model.ck
 
 Then you will get the generated results at `./api/demo/generations`.
 
-
 ### Tutorials
 
 Here we illustrate how we assembled the demo case, so that the users can customize configurations to run designs on their target of interest.
@@ -72,43 +70,43 @@ Here we illustrate how we assembled the demo case, so that the users can customi
 1. **Reference Binder.** Find a complex on PDB with a reference binder. Here we locate [**7mdp**](https://www.rcsb.org/structure/7MDP), which includes an antibody inhibitor to KRas G12C. This reference antibody helps the program to identify on which binding site the model should design binders.
 
 2. **(Optional) Antibody Renumbering.** If you want to design antibodies, currently UniMoMo only supports designing CDRs on the antibody framework docked on the target proteins. The program relies on the Chothia numbering system to identify which parts on the antibody are CDRs, so the residue IDs in the given PDB file should be renumbered according to Chothia system. We have provided the toolkit in `./api/renumber.py`. With running the following command, the renumbered PDB file will be saved at `./api/demo/7mdp_chothia.pdb`:
-
-    ```bash
-    cd api
-    python renumber.py demo/7mdp.pdb demo/7mdp_chothia.pdb chothia
-    ```
+   
+   ```bash
+   cd api
+   python renumber.py demo/7mdp.pdb demo/7mdp_chothia.pdb chothia
+   ```
 
 3. **Configure.** Write a config clarifying the chain IDs of the target protein and the ligand, as well as the types and the numbers of binders to generate. Here we demonstrate the meaning of the config at `./api/demo/config.yaml`:
-
-    ```yaml
-    # contents of ./api/demo/config.yaml
-    dataset:
-      # Multiple references can be provided. You just need to add the corresponding information in a new line under each of pdb_paths, tgt_chains, and lig_chains.
-      pdb_paths:
-        - ./api/demo/7mdp_chothia.pdb   # Path to the reference complex.
-      tgt_chains:
-        - A     # The target proteins only include one chain, that is A.
-      lig_chains:
-        - HI    # The reference binder includes two chains, that is H and I. With antibody provided, the program assumes the heavy chain goes before the light chain, which means it will regard H as the heavy chain and I as the light chain in this case.
-    
-    templates:
-      # Here we specify the type of binders we want to design
-      - class: LinearPeptide    # Linear peptides with at lengths between 10 to 12, left inclusive and right exclusive.
-        size_min: 10
-        size_max: 12
-      - class: Antibody     # Design HCDR3 on the given antigen-antibody complex. If multiple CDRs need to be designed, it is suggested to run designs sequentially, with one CDR designed each time.
-        cdr_type: HCDR3
-      - class: Molecule     # Small molecules. By default the number of blocks is sampled according to the spatial size of the binding site. You can also specify "size_min" and/or "size_max" to control the threshold of the sampled number of blocks.
-        
-    batch_size: 8   # Batch size. Adjust it according to your GPU memory available. Batch size = 8 can be run under 12G memory for most cases.
-    n_samples: 20  # Number of generations. On each target provided, the model will generate 20 candidates for each template.
-    ```
+   
+   ```yaml
+   # contents of ./api/demo/config.yaml
+   dataset:
+     # Multiple references can be provided. You just need to add the corresponding information in a new line under each of pdb_paths, tgt_chains, and lig_chains.
+     pdb_paths:
+       - ./api/demo/7mdp_chothia.pdb   # Path to the reference complex.
+     tgt_chains:
+       - A     # The target proteins only include one chain, that is A.
+     lig_chains:
+       - HI    # The reference binder includes two chains, that is H and I. With antibody provided, the program assumes the heavy chain goes before the light chain, which means it will regard H as the heavy chain and I as the light chain in this case.
+   
+   templates:
+     # Here we specify the type of binders we want to design
+     - class: LinearPeptide    # Linear peptides with at lengths between 10 to 12, left inclusive and right exclusive.
+       size_min: 10
+       size_max: 12
+     - class: Antibody     # Design HCDR3 on the given antigen-antibody complex. If multiple CDRs need to be designed, it is suggested to run designs sequentially, with one CDR designed each time.
+       cdr_type: HCDR3
+     - class: Molecule     # Small molecules. By default the number of blocks is sampled according to the spatial size of the binding site. You can also specify "size_min" and/or "size_max" to control the threshold of the sampled number of blocks.
+   
+   batch_size: 8   # Batch size. Adjust it according to your GPU memory available. Batch size = 8 can be run under 12G memory for most cases.
+   n_samples: 20  # Number of generations. On each target provided, the model will generate 20 candidates for each template.
+   ```
 
 4. **Generation.** Finally, you can use the config to generate results via the following command, where `--config`, `--ckpt`, `--save_dir`, and `--gpu` specify the configuration, the checkpoint, the output directory, and the GPU to use, respectively:
-
-    ```bash
-    python -m api.generate --config api/demo/config.yaml --ckpt checkpoints/model.ckpt --save_dir api/demo/generations --gpu 0
-    ```
+   
+   ```bash
+   python -m api.generate --config api/demo/config.yaml --ckpt checkpoints/model.ckpt --save_dir api/demo/generations --gpu 0
+   ```
 
 ## :page_facing_up: Reproduction of Paper Experiments
 
@@ -162,7 +160,7 @@ python -m scripts.data_process.peptide.pepbench --index ${PREFIX}/ProtFrag/all.t
 
 #### 2. Antibody
 
-Suppose all data are saved under `./datasets/antibody`. We set environment variable `export PREFIX=./datasets/antibody`. We use SAbDab downloaded at **Sep 24th, 2024** for training, validation, and testing on antibody CDR design.
+Suppose all data are saved under `./datasets/antibody`. We set environment variable `export PREFIX=./datasets/antibody`. We use SAbDab downloaded at **Sep 24th, 2024** for training, validation, and testing on antibody CDR design, with testing complexes coming from RAbD. As the database is weekly updated, we also provide the IDs of the complexes used in our paper for reproduction and benchmarking purposes in `./datasets/antibody/train_id.txt`, `./datasets/antibody/valid_id.txt`, and `./datasets/antibody/test_id.txt`.
 
 Download with the newest updates:
 
@@ -239,7 +237,6 @@ DATA_DIR=/path/to/CrossDocked/crossdocked_pocket10
 ```
 
 The evaluation scripts are as follows. Note that the evaluation process is CPU-intensive. During our experiments, each of them requires running for several hours on 96 cpu cores.
-
 
 ```bash
 # peptide
