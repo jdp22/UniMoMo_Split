@@ -160,7 +160,7 @@ python -m scripts.data_process.peptide.pepbench --index ${PREFIX}/ProtFrag/all.t
 
 #### 2. Antibody
 
-Suppose all data are saved under `./datasets/antibody`. We set environment variable `export PREFIX=./datasets/antibody`. We use SAbDab downloaded at **Sep 24th, 2024** for training, validation, and testing on antibody CDR design, with testing complexes coming from RAbD. As the database is weekly updated, we also provide the IDs of the complexes used in our paper for reproduction and benchmarking purposes in `./datasets/antibody/train_id.txt`, `./datasets/antibody/valid_id.txt`, and `./datasets/antibody/test_id.txt`.
+Suppose all data are saved under `./datasets/antibody`. We set environment variable `export PREFIX=./datasets/antibody`. We use SAbDab downloaded at **Sep 24th, 2024** for training, validation, and testing on antibody CDR design, with testing complexes coming from RAbD. As the database is weekly updated, we also provide the IDs of the complexes used in our paper for reproduction and benchmarking purposes under `./datasets/antibody`(train/valid/test_id.txt). You can use these IDs to filter the downloaded SAbDab database to reconstruct the splits used in our paper.
 
 Download with the newest updates:
 
