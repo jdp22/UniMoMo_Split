@@ -13,6 +13,7 @@ dependencies:
   - nvidia::cudatoolkit=11.7.0
   - mkl=2024.0.0
   - pyg::pytorch-scatter
+  - bioconda::anarci
   - biopython=1.80
   - scikit-learn
   - scipy
