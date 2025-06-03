@@ -56,6 +56,8 @@ wget https://github.com/kxz18/UniMoMo/releases/download/v1.0/model.ckpt
 
 :bangbang: Before using the following codes, please first download the trained weights mentioned above.
 
+**Small Molecule / Peptide / Antibody CDR Design**
+
 We have prepared cleaned codes for inferencing on single or multiple target proteins of interest, which are located under `./api`. An example is provided at `./api/demo` which designs small molecule, peptide, and antibody binders to KRas G12C on the same binding site. You can directly run the example by:
 
 ```bash
@@ -63,6 +65,14 @@ python -m api.generate --config api/demo/config.yaml --ckpt checkpoints/model.ck
 ```
 
 Then you will get the generated results at `./api/demo/generations`.
+
+**Nanobody Design**
+
+We have also provided a demo for Nanobody design with the config `./api/demo/nanobody_config.yaml`. In this case, we use Alphafold 3 to cofold KRas G12C and a nanobody h-NbBCII10 (PDB ID: 3EAK) to get a pseudo complex structure. The Alphafold 3 tends to memorize common binding sites on target proteins and docking orientations for nanobodies/antibodies, thus will produce seemingly reasonable complexes, which is enough as we only need the docked framework for CDR design. It is then renumber with Chothia system to get the input file `./api/demo/7mdp_3eak_chothia.pdb`. The antibody template is naturally compatible with nanobodies, therefore we can directly treat it as an antibody with only the heavy chain in the configuration and run:
+
+```bash
+python -m api.generate --config api/demo/nanobody_config.yaml --ckpt checkpoints/model.ckpt --save_dir api/demo/nanobody_generations --gpu 0
+```
 
 
 ### Tutorials
