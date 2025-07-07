@@ -217,7 +217,7 @@ python -m scripts.data_process.molecule.crossdocked --split ${PREFIX}/CrossDocke
 
 ### Training
 
-Training of the full UniMoMo requires 8 A800 GPUs with 80G memmory each. The process includes training an all-atom variational encoder, and a block-level latent diffusion model, which commonly takes about 2-3 days.
+Training of the full UniMoMo requires 8 GPUs with 80G memmory each. The process includes training an all-atom variational encoder, and a block-level latent diffusion model, which commonly takes about 2-3 days. We also enable TF32 by setting the environment variable `TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1` for accelerated training and optimized GPU memory usage.
 
 ```bash
 GPU=0,1,2,3,4,5,6,7 bash scripts/train_pipe.sh ./ckpts/unimomo ./configs/IterAE/train.yaml ./configs/LDM/train.yaml
