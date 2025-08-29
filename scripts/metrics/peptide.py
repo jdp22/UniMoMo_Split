@@ -265,8 +265,8 @@ def run_dG(task: Task):
         relax_save_pdb=gen_pdb.rstrip('.pdb') + '_rosetta.pdb')
     dG = round(dG, 2)
     task.metrics['dG'] = dG
-    task.metrics['ddG'] = dG - task.ref_metrics['ref_dG_relax']
-    task.metrics['ddG <= 0 (IMP)'] = dG <= task.ref_metrics['ref_dG_relax']
+    task.metrics['ddG'] = dG - task.ref_metrics['ref_dG']
+    task.metrics['ddG <= 0 (IMP)'] = dG <= task.ref_metrics['ref_dG']
 
     return task
 
