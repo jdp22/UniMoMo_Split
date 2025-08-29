@@ -171,7 +171,7 @@ python -m scripts.data_process.peptide.pepbench --index ${PREFIX}/ProtFrag/all.t
 
 #### 2. Antibody
 
-Suppose all data are saved under `./datasets/antibody`. We set environment variable `export PREFIX=./datasets/antibody`. We use SAbDab downloaded at **Sep 24th, 2024** for training, validation, and testing on antibody CDR design, with testing complexes coming from RAbD. As the database is weekly updated, we also provide the IDs of the complexes used in our paper for reproduction and benchmarking purposes under `./datasets/antibody`(train/valid/test_id.txt). You can use these IDs to filter the downloaded SAbDab database to reconstruct the splits used in our paper.
+Suppose all data are saved under `./datasets/antibody`. We set environment variable `export PREFIX=./datasets/antibody`. We use SAbDab downloaded at **Sep 24th, 2024** for training, validation, and testing on antibody CDR design, with testing complexes coming from RAbD. As the database is weekly updated, we have also uploaded the processed binary files and index files on [google drive](https://drive.google.com/file/d/1N5Y46B0CBDQ4fOxkiMCuyPz3yPdDYVG-/view?usp=sharing) for reproduction and benchmarking purposes. We also provide the IDs of the complexes used in our paper under `./datasets/antibody`(train/valid/test_id.txt), so that users can use these IDs to filter the downloaded SAbDab database to reconstruct the splits used in our paper.
 
 Download with the newest updates:
 
@@ -217,7 +217,7 @@ python -m scripts.data_process.molecule.crossdocked --split ${PREFIX}/CrossDocke
 
 ### Training
 
-Training of the full UniMoMo requires 8 A800 GPUs with 80G memmory each. The process includes training an all-atom variational encoder, and a block-level latent diffusion model, which commonly takes about 2-3 days.
+Training of the full UniMoMo requires 8 GPUs with 80G memmory each. The process includes training an all-atom variational encoder, and a block-level latent diffusion model, which commonly takes about 2-3 days. We also enable TF32 by setting the environment variable `TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1` for accelerated training and optimized GPU memory usage.
 
 ```bash
 GPU=0,1,2,3,4,5,6,7 bash scripts/train_pipe.sh ./ckpts/unimomo ./configs/IterAE/train.yaml ./configs/LDM/train.yaml
