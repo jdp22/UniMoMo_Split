@@ -83,6 +83,7 @@ trainer:
     save_topk: 10
     val_freq: 10
     save_dir: ./ckpts/unimomo
+    grad_clip: 1.0
     patience: 10
     warmup: 2000 # gradually increasing KL divergence for training stability (8 A800 GPUs)
     metric_min_better: true
