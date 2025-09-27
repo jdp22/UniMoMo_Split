@@ -273,7 +273,7 @@ class CondIterAutoEncoder(nn.Module):
             'block_type_loss': F.cross_entropy(
                 input=pred_block_logits[generate_mask | binding_site_gen_mask],
                 target=S_gt[generate_mask | binding_site_gen_mask]
-            ).clamp_max(10.),
+            ),
             'atom_coord_loss': F.mse_loss(
                 pred_vector[loss_mask | binding_site_loss_mask],
                 vector[loss_mask | binding_site_loss_mask], reduction='none'
