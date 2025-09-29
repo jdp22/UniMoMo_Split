@@ -38,6 +38,8 @@ def get_best_ckpt(ckpt_dir):
 
 
 def to_device(data, device):
+    # Recursively move any tensors (or collections of tensors) onto the
+    # desired device, keeping the original data structure intact.
     if isinstance(data, dict):
         for key in data:
             data[key] = to_device(data[key], device)
@@ -66,6 +68,9 @@ def generate_wrapper(model, sample_opt={}):
             return batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds
     elif isinstance(model, models.LDMMolDesign):# or isinstance(model, models.LFMMolDesign):
         def wrapper(batch):
+            # Sampling APIs may return different tuple lengths depending on
+            # whether intra-bond predictions are supported, so we normalize the
+            # outputs to a consistent 6-tuple.
             res_tuple = model.sample(sample_opt=sample_opt, **batch)
             if len(res_tuple) == 6:
                 batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds = res_tuple
