@@ -121,28 +121,40 @@ Here we illustrate how we assembled the demo case, so that the users can customi
 
 ### Molecule Partition CLI
 
-We provide a lightweight command-line utility for experimenting with random molecular partitions at `scripts/chem/partition_demo.py`. The tool now reports a structured JSON document that includes both the atom index groups and the corresponding fragment SMILES so that downstream scripts can reuse the fragments directly.
+We provide a lightweight command-line utility for experimenting with random molecular partitions at `scripts/chem/partition_demo.py`. It wraps the `random_subgraph_partition` helper and is primarily intended for inspecting how UniMoMo splits molecules into chemically meaningful building blocks before generation.
+
+#### Features
+
+* **Ring-aware partitioning.** Aromatic rings are treated as indivisible units: fused ring systems are never broken apart and always appear within the same partition. This guarantees that common motifs—such as benzene (`c1ccccc1`)—remain intact even when multiple fragments are requested.
+* **Deterministic seeds.** Provide `--seed` to obtain reproducible partitions when debugging or preparing curated fragment libraries.
+* **Fragment SMILES.** When `--show-smiles` is enabled (default), the CLI emits two fragment representations alongside the atom index partitions:
+  * `fragments`: canonical RDKit fragment SMILES.
+  * `fragments_with_attachment_points`: SMILES decorated with wildcard (`*`) atoms wherever a bond crosses a partition boundary, making attachment sites explicit for downstream assembly.
+
+#### Interface and Usage
+
+Run the script with a SMILES string and the desired number of partitions:
 
 ```bash
 python scripts/chem/partition_demo.py "CCCC" --partitions 2 --seed 0
-# {"partitions": [[0, 1], [2, 3]], "fragments": ["*CC", "*CC"]}
+# {"partitions": [[0, 1], [2, 3]], "fragments": ["*CC", "*CC"], "fragments_with_attachment_points": ["*CC", "*CC"]}
 ```
 
-Use `--seed` to obtain reproducible partitions and `--partitions` (or `-k`) to control how many connected fragments are generated. The CLI exposes a `--show-smiles/--no-show-smiles` toggle; disabling it will omit the `fragments` field when you only care about atom indices:
+The JSON payload always includes the `partitions` field; the SMILES fields can be suppressed via `--no-show-smiles` if only atom indices are required:
 
 ```bash
 python scripts/chem/partition_demo.py "c1ccccc1" --partitions 3 --seed 13 --no-show-smiles
 # {"partitions": [[0, 5], [1], [2, 3, 4]]}
 ```
 
-When SMILES output is enabled (the default), aromatic systems and explicit hydrogens are preserved in each fragment representation. Aromatic ring systems are treated as indivisible building blocks so that fused rings remain intact. Requesting more partitions than the number of fused ring systems plus non-ring atoms will raise an error:
+Partition requests are validated to respect ring integrity. If the requested number of partitions exceeds the available combination of fused ring systems and non-ring atoms, an error is raised instead of slicing a ring apart:
 
 ```bash
 python scripts/chem/partition_demo.py "Cc1ccccc1" --partitions 3 --seed 2
 # num_partitions cannot exceed the number of ring systems plus non-ring atoms
 
 python scripts/chem/partition_demo.py "Cc1ccccc1" --partitions 2 --seed 2
-# {"partitions": [[0], [1, 2, 3, 4, 5, 6]], "fragments": ["*C", "*c1ccccc1"]}
+# {"partitions": [[0], [1, 2, 3, 4, 5, 6]], "fragments": ["*C", "*c1ccccc1"], "fragments_with_attachment_points": ["C*", "*c1ccccc1*"]}
 ```
 
 ## :page_facing_up: Reproduction of Paper Experiments
