@@ -331,7 +331,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: List[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     mol = Chem.MolFromSmiles(args.smiles)
     if mol is None:
