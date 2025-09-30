@@ -49,6 +49,10 @@ def random_subgraph_partition(
             preservation constraint, or the SMILES string cannot be parsed.
     """
 
+    # Example: ``random_subgraph_partition("Cc1ccccc1", 3, seed=7)`` returns
+    # ``[[0], [1, 2, 3, 4, 5, 6], [7]]``—the two methyl carbons are separated
+    # while the aromatic ring remains intact as a single fused system.
+
     mol = _ensure_mol(mol_or_smiles)
     num_atoms = mol.GetNumAtoms()
     if num_atoms == 0:
