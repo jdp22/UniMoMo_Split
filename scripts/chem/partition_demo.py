@@ -5,9 +5,12 @@ import json
 import random
 import sys
 from collections import defaultdict
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Union
 
 from rdkit import Chem
+
+from utils.subgraph_storage import SubgraphStorage
 
 
 def _ensure_mol(mol_or_smiles: Union[str, Chem.Mol]) -> Chem.Mol:
@@ -383,6 +386,21 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         default=True,
         help="Include fragment SMILES in the JSON output (default: True).",
     )
+    parser.add_argument(
+        "--store-subgraphs",
+        type=Path,
+        default=None,
+        help="Optional path to a JSONL file where fragments will be stored.",
+    )
+    parser.add_argument(
+        "--min-heavy-atoms",
+        type=int,
+        default=0,
+        help=(
+            "Minimum number of heavy atoms (non-hydrogen) a fragment must have to be stored. "
+            "Set to 0 to disable filtering (default)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -405,6 +423,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         payload["fragments_with_attachment_points"] = fragment_smiles_with_attachment_points(
             mol, partitions
         )
+
+    if args.store_subgraphs is not None:
+        try:
+            storage = SubgraphStorage(
+                args.store_subgraphs,
+                min_heavy_atoms=args.min_heavy_atoms,
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+
+        stored = storage.store_partitions(
+            mol,
+            partitions,
+            metadata={
+                "requested_partitions": args.partitions,
+                "seed": args.seed,
+            },
+        )
+        payload["stored_fragments"] = stored
+        payload["storage_path"] = str(storage.output_path.resolve())
 
     print(json.dumps(payload))
     return 0
