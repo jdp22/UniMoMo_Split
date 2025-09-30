@@ -333,6 +333,7 @@ def fragment_smiles_with_attachment_points(
             working_mol = mol
 
         atoms_to_use: Set[int] = set(group)
+
         for atom in working_mol.GetAtoms():
             if (
                 boundary_bonds
