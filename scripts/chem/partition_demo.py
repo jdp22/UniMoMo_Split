@@ -333,12 +333,17 @@ def fragment_smiles_with_attachment_points(
             working_mol = mol
 
         atoms_to_use: Set[int] = set(group)
-        if boundary_bonds:
-            for atom in working_mol.GetAtoms():
-                if atom.GetAtomicNum() != 0:
-                    continue
-                if any(neighbor.GetIdx() in atoms_in_group for neighbor in atom.GetNeighbors()):
-                    atoms_to_use.add(atom.GetIdx())
+
+        for atom in working_mol.GetAtoms():
+            if (
+                boundary_bonds
+                and atom.GetAtomicNum() == 0
+                and any(neighbor.GetIdx() in atoms_in_group for neighbor in atom.GetNeighbors())
+            ):
+                atoms_to_use.add(atom.GetIdx())
+            atom.SetAtomMapNum(0)
+            if atom.HasProp("molAtomMapNumber"):
+                atom.ClearProp("molAtomMapNumber")
 
         smiles = Chem.MolFragmentToSmiles(
             working_mol,
