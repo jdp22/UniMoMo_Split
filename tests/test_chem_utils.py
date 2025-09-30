@@ -1,5 +1,7 @@
 """Tests for the subgraph partition demo script."""
 
+import json
+
 import pytest
 from rdkit import Chem
 
@@ -7,6 +9,7 @@ from scripts.chem.partition_demo import (
     fragment_smiles_for_partitions,
     random_subgraph_partition,
 )
+from utils.subgraph_storage import SubgraphStorage
 
 
 def _expected_fragment_smiles(mol: Chem.Mol, partitions):
@@ -78,3 +81,42 @@ def test_random_subgraph_partition_invalid_num_parts():
         random_subgraph_partition(mol, 3)
     with pytest.raises(ValueError):
         random_subgraph_partition(mol, 0)
+
+
+def test_subgraph_storage_persists_fragments(tmp_path):
+    mol = Chem.MolFromSmiles("CCO")
+    partitions = [[0, 1], [2]]
+
+    storage_path = tmp_path / "fragments.jsonl"
+    storage = SubgraphStorage(storage_path, min_heavy_atoms=0)
+    stored = storage.store_partitions(
+        mol,
+        partitions,
+        metadata={"tag": "unit-test"},
+    )
+
+    assert stored == 2
+    lines = storage_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+    records = [json.loads(line) for line in lines]
+
+    expected_smiles = fragment_smiles_for_partitions(mol, partitions)
+    assert {record["fragment_smiles"] for record in records} == set(expected_smiles)
+    assert all(record["source_smiles"] == Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True) for record in records)
+    assert all(record["metadata"] == {"tag": "unit-test"} for record in records)
+
+
+def test_subgraph_storage_filters_by_heavy_atoms(tmp_path):
+    mol = Chem.MolFromSmiles("CCO")
+    partitions = [[0, 1], [2]]
+
+    storage_path = tmp_path / "filtered.jsonl"
+    storage = SubgraphStorage(storage_path, min_heavy_atoms=1)
+    stored = storage.store_partitions(mol, partitions)
+
+    assert stored == 1
+    lines = storage_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["heavy_atom_count"] == 2
+    assert record["fragment_smiles"] in fragment_smiles_for_partitions(mol, partitions)
