@@ -4,7 +4,8 @@ import argparse
 import json
 import random
 import sys
-from typing import List, Optional, Set, Union
+from collections import defaultdict
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Union
 
 from rdkit import Chem
 
@@ -27,10 +28,16 @@ def random_subgraph_partition(
 ) -> List[List[int]]:
     """Randomly partition a molecule into connected subgraphs.
 
+    The implementation respects aromatic ring systems, ensuring that every atom
+    belonging to a fused ring set is assigned to the same partition. This keeps
+    chemically intuitive fragments (e.g., benzene rings) intact instead of
+    arbitrarily splitting the ring across multiple fragments.
+
     Args:
         mol_or_smiles: The input molecule or SMILES string.
         num_partitions: Number of partitions to generate. Must be in
-            ``[1, mol.GetNumAtoms()]``.
+            ``[1, mol.GetNumAtoms()]`` and cannot exceed the number of available
+            ring systems plus the number of non-ring atoms.
         seed: Optional random seed to make the partitioning deterministic.
 
     Returns:
@@ -38,8 +45,8 @@ def random_subgraph_partition(
         connected within the input molecule.
 
     Raises:
-        ValueError: If the number of partitions is invalid or the SMILES string
-            cannot be parsed.
+        ValueError: If the number of partitions is invalid, violates the ring
+            preservation constraint, or the SMILES string cannot be parsed.
     """
 
     mol = _ensure_mol(mol_or_smiles)
@@ -49,37 +56,166 @@ def random_subgraph_partition(
 
     if num_partitions <= 0:
         raise ValueError("num_partitions must be a positive integer")
+
+    ring_systems = _ring_systems(mol)
+    ring_atom_ids = {atom_idx for system in ring_systems for atom_idx in system}
+    non_ring_atoms = [idx for idx in range(num_atoms) if idx not in ring_atom_ids]
+
+    max_partitions = len(non_ring_atoms) + len(ring_systems)
+    if num_partitions > max_partitions:
+        raise ValueError(
+            "num_partitions cannot exceed the number of ring systems plus non-ring atoms"
+        )
     if num_partitions > num_atoms:
         raise ValueError(
             f"num_partitions ({num_partitions}) cannot exceed number of atoms ({num_atoms})"
         )
 
+    unit_partitions = _random_partition_units(
+        mol,
+        ring_systems=ring_systems,
+        non_ring_atoms=non_ring_atoms,
+        num_partitions=num_partitions,
+        seed=seed,
+    )
+
+    normalized_partitions = [sorted(group) for group in unit_partitions if group]
+    normalized_partitions.sort(key=lambda group: (group[0], len(group)))
+    return normalized_partitions
+
+
+def _ring_systems(mol: Chem.Mol) -> List[Set[int]]:
+    """Return fused ring systems as disjoint atom index sets."""
+
+    ring_info = Chem.GetSymmSSSR(mol)
+    if not ring_info:
+        return []
+
+    parent = list(range(len(ring_info)))
+
+    def find(idx: int) -> int:
+        while parent[idx] != idx:
+            parent[idx] = parent[parent[idx]]
+            idx = parent[idx]
+        return idx
+
+    def union(a: int, b: int) -> None:
+        root_a = find(a)
+        root_b = find(b)
+        if root_a != root_b:
+            parent[root_b] = root_a
+
+    rings = [set(map(int, ring)) for ring in ring_info]
+    for i, ring_i in enumerate(rings):
+        for j in range(i + 1, len(rings)):
+            if ring_i & rings[j]:
+                union(i, j)
+
+    systems: Dict[int, Set[int]] = defaultdict(set)
+    for idx, ring in enumerate(rings):
+        systems[find(idx)].update(ring)
+
+    return list(systems.values())
+
+
+def _random_partition_units(
+    mol: Chem.Mol,
+    ring_systems: Sequence[Set[int]],
+    non_ring_atoms: Sequence[int],
+    num_partitions: int,
+    seed: Optional[int],
+) -> List[List[int]]:
+    """Partition a molecule while keeping each ring system intact."""
+
+    units: List[Set[int]] = [set(system) for system in ring_systems]
+    units.extend([{atom_idx} for atom_idx in non_ring_atoms])
+
+    if not units:
+        return []
+
+    atom_to_unit: Dict[int, int] = {}
+    for unit_idx, atom_set in enumerate(units):
+        for atom in atom_set:
+            atom_to_unit[atom] = unit_idx
+
+    neighbor_map: Dict[int, Set[int]] = {idx: set() for idx in range(len(units))}
+    for bond in mol.GetBonds():
+        begin = bond.GetBeginAtomIdx()
+        end = bond.GetEndAtomIdx()
+        unit_a = atom_to_unit[begin]
+        unit_b = atom_to_unit[end]
+        if unit_a == unit_b:
+            continue
+        neighbor_map[unit_a].add(unit_b)
+        neighbor_map[unit_b].add(unit_a)
+
+    unit_partitions = _random_partition_graph(
+        neighbor_map={idx: sorted(neighbors) for idx, neighbors in neighbor_map.items()},
+        num_partitions=num_partitions,
+        seed=seed,
+    )
+
+    return [
+        sorted({atom for unit_idx in group for atom in units[unit_idx]})
+        for group in unit_partitions
+    ]
+
+
+def _random_partition_graph(
+    neighbor_map: Dict[int, Iterable[int]], num_partitions: int, seed: Optional[int]
+) -> List[List[int]]:
+    """Partition a generic graph described by ``neighbor_map``."""
+
+    node_indices = sorted(neighbor_map)
+    if not node_indices:
+        return []
+
+    num_nodes = len(node_indices)
+    if num_partitions <= 0:
+        raise ValueError("num_partitions must be a positive integer")
+    if num_partitions > num_nodes:
+        raise ValueError(
+            f"num_partitions ({num_partitions}) cannot exceed number of nodes ({num_nodes})"
+        )
+
     rng = random.Random(seed)
-    atom_indices = list(range(num_atoms))
-    seeds = rng.sample(atom_indices, num_partitions)
 
-    partitions: List[List[int]] = [[seed_idx] for seed_idx in seeds]
-    assigned = {seed_idx: part_idx for part_idx, seed_idx in enumerate(seeds)}
-
-    neighbor_map = {
-        atom_idx: [nbr.GetIdx() for nbr in mol.GetAtomWithIdx(atom_idx).GetNeighbors()]
-        for atom_idx in atom_indices
+    adjacency: Dict[int, List[int]] = {
+        node: sorted(set(neighbor_map[node])) for node in node_indices
     }
 
-    frontier: List[Set[int]] = [set(neighbor_map[idx]) for idx in seeds]
+    components = _connected_components(adjacency)
+    if num_partitions < len(components):
+        raise ValueError(
+            "num_partitions must be at least the number of connected components"
+        )
 
-    while len(assigned) < num_atoms:
+    seeds: List[int] = []
+    for component in components:
+        seeds.append(rng.choice(sorted(component)))
+
+    remaining_nodes = [node for node in node_indices if node not in seeds]
+    additional = num_partitions - len(seeds)
+    if additional > 0:
+        seeds.extend(rng.sample(remaining_nodes, additional))
+
+    partitions: List[List[int]] = [[seed_node] for seed_node in seeds]
+    assigned = {seed_node: part_idx for part_idx, seed_node in enumerate(seeds)}
+
+    frontier: List[Set[int]] = [set(adjacency[idx]) for idx in seeds]
+
+    while len(assigned) < num_nodes:
         progress_made = False
         for part_idx in range(num_partitions):
-            if len(assigned) == num_atoms:
+            if len(assigned) == num_nodes:
                 break
 
             candidates = [idx for idx in frontier[part_idx] if idx not in assigned]
             if not candidates:
                 candidates = [
                     nbr
-                    for atom_idx in partitions[part_idx]
-                    for nbr in neighbor_map[atom_idx]
+                    for node_idx in partitions[part_idx]
+                    for nbr in adjacency[node_idx]
                     if nbr not in assigned
                 ]
 
@@ -89,22 +225,76 @@ def random_subgraph_partition(
             chosen = rng.choice(candidates)
             partitions[part_idx].append(chosen)
             assigned[chosen] = part_idx
-            frontier[part_idx].update(neighbor_map[chosen])
+            frontier[part_idx].update(adjacency[chosen])
             progress_made = True
 
         if progress_made:
             continue
 
-        remaining = sorted(idx for idx in atom_indices if idx not in assigned)
-        for atom_idx in remaining:
-            part_idx = min(range(num_partitions), key=lambda i: len(partitions[i]))
-            partitions[part_idx].append(atom_idx)
-            assigned[atom_idx] = part_idx
-        break
+        remaining = sorted(node for node in node_indices if node not in assigned)
+        if not remaining:
+            break
+
+        for node_idx in remaining:
+            adjacent_parts = {
+                assigned[neighbor]
+                for neighbor in adjacency[node_idx]
+                if neighbor in assigned
+            }
+            if not adjacent_parts:
+                raise ValueError(
+                    "Unable to assign node while preserving connectivity."
+                )
+            part_idx = min(adjacent_parts, key=lambda i: len(partitions[i]))
+            partitions[part_idx].append(node_idx)
+            assigned[node_idx] = part_idx
+            frontier[part_idx].update(adjacency[node_idx])
 
     normalized_partitions = [sorted(group) for group in partitions if group]
     normalized_partitions.sort(key=lambda group: (group[0], len(group)))
     return normalized_partitions
+
+
+def _connected_components(adjacency: Dict[int, Sequence[int]]) -> List[Set[int]]:
+    """Return connected components from an adjacency mapping."""
+
+    visited: Set[int] = set()
+    components: List[Set[int]] = []
+    for node in adjacency:
+        if node in visited:
+            continue
+        stack = [node]
+        component: Set[int] = set()
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            component.add(current)
+            for neighbor in adjacency[current]:
+                if neighbor not in visited:
+                    stack.append(neighbor)
+        components.append(component)
+    return components
+
+
+def fragment_smiles_for_partitions(mol: Chem.Mol, partitions: List[List[int]]) -> List[str]:
+    """Generate canonical fragment SMILES for each partition."""
+
+    if not partitions:
+        return []
+
+    has_explicit_h = any(atom.GetAtomicNum() == 1 for atom in mol.GetAtoms())
+    return [
+        Chem.MolFragmentToSmiles(
+            mol,
+            atomsToUse=group,
+            canonical=True,
+            isomericSmiles=True,
+            allHsExplicit=has_explicit_h,
+        )
+        for group in partitions
+    ]
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
@@ -128,6 +318,12 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         default=None,
         help="Optional random seed for reproducibility.",
     )
+    parser.add_argument(
+        "--show-smiles",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include fragment SMILES in the JSON output (default: True).",
+    )
     return parser.parse_args(argv)
 
 
@@ -144,7 +340,11 @@ def main(argv: List[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
-    print(json.dumps(partitions))
+    payload = {"partitions": partitions}
+    if args.show_smiles:
+        payload["fragments"] = fragment_smiles_for_partitions(mol, partitions)
+
+    print(json.dumps(payload))
     return 0
 
 

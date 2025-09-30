@@ -119,6 +119,32 @@ Here we illustrate how we assembled the demo case, so that the users can customi
    python -m api.generate --config api/demo/config.yaml --ckpt checkpoints/model.ckpt --save_dir api/demo/generations --gpu 0
    ```
 
+### Molecule Partition CLI
+
+We provide a lightweight command-line utility for experimenting with random molecular partitions at `scripts/chem/partition_demo.py`. The tool now reports a structured JSON document that includes both the atom index groups and the corresponding fragment SMILES so that downstream scripts can reuse the fragments directly.
+
+```bash
+python scripts/chem/partition_demo.py "CCCC" --partitions 2 --seed 0
+# {"partitions": [[0, 1], [2, 3]], "fragments": ["*CC", "*CC"]}
+```
+
+Use `--seed` to obtain reproducible partitions and `--partitions` (or `-k`) to control how many connected fragments are generated. The CLI exposes a `--show-smiles/--no-show-smiles` toggle; disabling it will omit the `fragments` field when you only care about atom indices:
+
+```bash
+python scripts/chem/partition_demo.py "c1ccccc1" --partitions 3 --seed 13 --no-show-smiles
+# {"partitions": [[0, 5], [1], [2, 3, 4]]}
+```
+
+When SMILES output is enabled (the default), aromatic systems and explicit hydrogens are preserved in each fragment representation. Aromatic ring systems are treated as indivisible building blocks so that fused rings remain intact. Requesting more partitions than the number of fused ring systems plus non-ring atoms will raise an error:
+
+```bash
+python scripts/chem/partition_demo.py "Cc1ccccc1" --partitions 3 --seed 2
+# num_partitions cannot exceed the number of ring systems plus non-ring atoms
+
+python scripts/chem/partition_demo.py "Cc1ccccc1" --partitions 2 --seed 2
+# {"partitions": [[0], [1, 2, 3, 4, 5, 6]], "fragments": ["*C", "*c1ccccc1"]}
+```
+
 ## :page_facing_up: Reproduction of Paper Experiments
 
 ### Additional Dependencies
