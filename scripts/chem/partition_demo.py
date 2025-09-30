@@ -301,6 +301,60 @@ def fragment_smiles_for_partitions(mol: Chem.Mol, partitions: List[List[int]]) -
     ]
 
 
+def fragment_smiles_with_attachment_points(
+    mol: Chem.Mol, partitions: List[List[int]]
+) -> List[str]:
+    """Generate fragment SMILES that expose inter-fragment attachment points.
+
+    Each returned SMILES string mirrors the canonical fragment representation but
+    replaces bonds that cross partition boundaries with wildcards (``*``).
+    This mirrors the common convention for denoting open valences in fragment
+    libraries.
+    """
+
+    if not partitions:
+        return []
+
+    smiles_with_markers: List[str] = []
+    for group in partitions:
+        atoms_in_group = set(group)
+        boundary_bonds: List[int] = []
+        for bond in mol.GetBonds():
+            begin = bond.GetBeginAtomIdx()
+            end = bond.GetEndAtomIdx()
+            in_begin = begin in atoms_in_group
+            in_end = end in atoms_in_group
+            if in_begin ^ in_end:
+                boundary_bonds.append(bond.GetIdx())
+
+        if boundary_bonds:
+            working_mol = Chem.FragmentOnBonds(mol, boundary_bonds, addDummies=True)
+        else:
+            working_mol = mol
+
+        atoms_to_use: Set[int] = set(group)
+        for atom in working_mol.GetAtoms():
+            if (
+                boundary_bonds
+                and atom.GetAtomicNum() == 0
+                and any(neighbor.GetIdx() in atoms_in_group for neighbor in atom.GetNeighbors())
+            ):
+                atoms_to_use.add(atom.GetIdx())
+            atom.SetAtomMapNum(0)
+            if atom.HasProp("molAtomMapNumber"):
+                atom.ClearProp("molAtomMapNumber")
+
+        smiles = Chem.MolFragmentToSmiles(
+            working_mol,
+            atomsToUse=sorted(atoms_to_use),
+            canonical=True,
+            isomericSmiles=True,
+        )
+        smiles_with_markers.append(smiles.replace("[*]", "*"))
+
+    return smiles_with_markers
+
+
 def parse_args(argv: List[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Partition a molecule into random connected subgraphs."
@@ -331,7 +385,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: List[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     mol = Chem.MolFromSmiles(args.smiles)
     if mol is None:
@@ -347,6 +401,9 @@ def main(argv: List[str] | None = None) -> int:
     payload = {"partitions": partitions}
     if args.show_smiles:
         payload["fragments"] = fragment_smiles_for_partitions(mol, partitions)
+        payload["fragments_with_attachment_points"] = fragment_smiles_with_attachment_points(
+            mol, partitions
+        )
 
     print(json.dumps(payload))
     return 0
