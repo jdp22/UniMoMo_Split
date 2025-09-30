@@ -2,7 +2,10 @@
 beta version
 '''
 import math
+import random
 from copy import copy
+from typing import List
+
 from tqdm import tqdm
 from queue import Queue
 
@@ -60,6 +63,7 @@ def smi2mol(smiles: str, kekulize=False, sanitize=True):
 
 def mol2smi(mol):
     return Chem.MolToSmiles(mol)
+
 
 
 def canonical_order(smiles: str):
