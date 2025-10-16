@@ -121,3 +121,51 @@ class SubgraphStorage:
                 stored += 1
 
         return stored
+
+
+class SubgraphIndex:
+    """Lightweight JSONL subgraph index for negative sampling.
+
+    Expects JSONL lines with at least keys:
+      - "source_smiles"
+      - "fragment_smiles"
+    Typically produced by ``SubgraphStorage.store_partitions``.
+    """
+
+    def __init__(self, jsonl_path: Union[str, Path], max_entries: Optional[int] = None):
+        self.jsonl_path = Path(jsonl_path)
+        self.src_to_frags: dict[str, list[str]] = {}
+        self.all_frags: list[str] = []
+        self.all_src: list[str] = []
+        self._load(max_entries)
+
+    def _load(self, max_entries: Optional[int]):
+        n = 0
+        with self.jsonl_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if max_entries is not None and n >= max_entries:
+                    break
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                src = rec.get("source_smiles")
+                frag = rec.get("fragment_smiles")
+                if not src or not frag:
+                    continue
+                self.src_to_frags.setdefault(src, []).append(frag)
+                self.all_frags.append(frag)
+                self.all_src.append(src)
+                n += 1
+
+    def sample_negatives(self, source_smiles: str, k: int = 8) -> list[str]:
+        """Random negatives from all fragments excluding the same source."""
+        import random
+        candidates = [frag for frag, s in zip(self.all_frags, self.all_src) if s != source_smiles]
+        if not candidates:
+            return []
+        if k >= len(candidates):
+            return random.sample(candidates, len(candidates))
+        return random.sample(candidates, k)

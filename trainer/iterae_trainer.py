@@ -96,6 +96,13 @@ class IterAETrainer(Trainer): # autoregressive autoencoder trainer
     ########## Override end ##########
 
     def share_step(self, batch, batch_idx, val=False):
+        # attach current epoch for logging (1-based for readability)
+        try:
+            batch['current_epoch'] = int(self.epoch) + 1
+        except Exception:
+            batch['current_epoch'] = self.epoch
+        rag_src = batch.get('rag_source_smiles', None)
+
         loss_dict = self.model(**batch)
         if self.is_oom_return(loss_dict):
             return loss_dict
@@ -109,6 +116,27 @@ class IterAETrainer(Trainer): # autoregressive autoencoder trainer
         if not val:
             lr = self.optimizer.state_dict()['param_groups'][0]['lr']
             self.log('lr', lr, batch_idx, val)
+
+            # update compact postfix for tqdm on train steps
+            try:
+                self._last_postfix = {
+                    'rag': loss_dict.get('rag_contrastive_loss', 0.0),
+                    'retr': loss_dict.get('retrieval_loss', 0.0),
+                    'bt': loss_dict.get('block_type_loss', 0.0),
+                    'bond': loss_dict.get('bond_loss', 0.0),
+                    'ld': loss_dict.get('local_distance_loss', 0.0),
+                }
+                anchor_metric = loss_dict.get('rag_anchor_count', loss_dict.get('rag_dyn_pos_candidates', None))
+                if anchor_metric is not None:
+                    self._last_postfix['ra'] = anchor_metric
+                if 'rag_dyn_pos_candidates' in loss_dict:
+                    self._last_postfix['rp'] = loss_dict['rag_dyn_pos_candidates']
+                if 'rag_negative_count' in loss_dict:
+                    self._last_postfix['rn'] = loss_dict['rag_negative_count']
+                if 'rag_debug_error' in loss_dict:
+                    self._last_postfix['re'] = loss_dict['rag_debug_error']
+            except Exception:
+                pass
 
         return loss
     

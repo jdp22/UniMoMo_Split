@@ -261,6 +261,26 @@ Training of the full UniMoMo requires 8 GPUs with 80G memmory each. The process 
 GPU=0,1,2,3,4,5,6,7 bash scripts/train_pipe.sh ./ckpts/unimomo ./configs/IterAE/train.yaml ./configs/LDM/train.yaml
 ```
 
+**Dynamic fragment thresholds & logging.** Retrieval-aware runs (e.g. `configs/IterAE/train_rag_dynamic_mol.yaml`) now accept staged heavy-atom thresholds through `min_heavy_atoms`. You can provide a list such as `[8, 4]`; the wrapper first keeps fragments with ≥8 heavy atoms, and if that would drop all fragments it relaxes to ≥4. The sampler still honours `storage_min_heavy_atoms` (default `8`) when writing JSONLs so the fragment index only stores sizeable substructures. When `zero_detail_log` is set, every time the RAG contrastive loss observes zero positives the model appends a JSON line describing the sample, available fragments and diagnostic flags to the specified file. Setting `success_detail_log` mirrors this for successful batches so you can sanity-check which samples still yield positives. Retrieval will first draw in-batch negatives, then exclude-aware index samples, and finally fall back to global fragments so peptides can borrow small-molecule negatives if needed.
+
+**Inspecting fragment coverage.** Two utility scripts help troubleshoot the availability of positive fragments:
+
+```bash
+# sanity-check dynamic partitions on a dataset slice
+python scripts/analysis/check_dynamic_partitions.py \
+  --config configs/IterAE/train_rag_dynamic_mol.yaml \
+  --split train --index 1 --limit 200 \
+  --dump-fragments ./logs/partition_fragments.json
+
+# summarise zero-positive batches during/after training
+python scripts/analysis/report_rag_zero.py \
+  --zero-log ./logs/rag_zero_positive.jsonl \
+  --fragments ./datasets/molecule/CrossDocked/subgraphs.dynamic.jsonl \
+  --output ./logs/rag_zero_positive_report.json
+```
+
+The first command reports per-sample fragment counts after filtering; the second correlates RAG zero-positive logs with the fragment store to reveal which SMILES were skipped by the contrastive loss.
+
 ### Inference
 
 The following commands generate 100 candidates for each target in the test sets, which are LNR, RAbD, and CrossDocked test set for peptide, antibody, and small molecule, respectively.
@@ -273,6 +293,13 @@ python generate.py --config configs/test/test_ab.yaml --ckpt /path/to/checkpoint
 # small molecule
 python generate.py --config configs/test/test_mol.yaml --ckpt /path/to/checkpoint.ckpt --gpu 0 --save_dir ./results/mol
 ```
+
+### Retrieval-aware training
+
+- Decoder block embeddings (`block_h`) are now aligned with fragment encodings: `rag_contrastive_loss` operates on these embeddings and uses dynamic fragments when available.
+- The same embeddings drive nearest-neighbour retrieval. When `retrieval_loss` observes valid positives the block-type classifier is automatically zeroed, otherwise it falls back to cross-entropy supervision.
+- Retrieval defaults to in-batch negatives; additional fragments can still be appended through `FragmentIndex` and dynamic partition JSONLs.
+- Cross-modal negatives: set `model.rag_opt.cross_modal_index` to a peptide fragment JSONL (e.g. `datasets/peptide/subgraphs_residue.train.jsonl`) and tune `cross_modal_neg_ratio` (0-1). When enabled, each InfoNCE batch blends molecule fragments with peptide residues and the reverse pairing for peptides.
 
 ### Evaluation
 

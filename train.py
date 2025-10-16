@@ -5,6 +5,7 @@ import argparse
 
 import yaml
 import torch
+import time
 
 from utils.logger import print_log
 from utils.random_seed import setup_seed, SEED
@@ -35,18 +36,33 @@ def parse():
 
 def main(args, opt_args):
 
-    # load config
+    t0 = time.time()
+    print_log(f'Loading config from {args.config} ...')
     config = yaml.safe_load(open(args.config, 'r'))
     config = overwrite_values(config, opt_args)
+    print_log(f'Config loaded in {time.time() - t0:.2f}s')
 
     ########## define your model #########
+    print_log('Constructing model ...')
+    t_model = time.time()
     model = R.construct(config['model'])
     if len(config.get('load_ckpt', '')):
         model.load_state_dict(torch.load(config['load_ckpt'], map_location='cpu').state_dict())
         print_log(f'Loaded weights from {config["load_ckpt"]}')
+    print_log(f'Model ready in {time.time() - t_model:.2f}s')
 
     ########### load your train / valid set ###########
-    train_set, valid_set, _ = create_dataset(config['dataset'])
+    print_log('Building datasets (train/valid/test) ...')
+    t_data = time.time()
+    train_set, valid_set, test_set = create_dataset(config['dataset'])
+    print_log(
+        'Datasets ready in {:.2f}s | train={} valid={} test={}'.format(
+            time.time() - t_data,
+            len(train_set) if train_set is not None else 0,
+            len(valid_set) if valid_set is not None else 0,
+            len(test_set) if test_set is not None else 0,
+        )
+    )
 
     ########## define your trainer/trainconfig #########
     if len(args.gpus) > 1:

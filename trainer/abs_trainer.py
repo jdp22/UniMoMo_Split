@@ -81,6 +81,8 @@ class Trainer:
         self.last_valid_metric = None
         self.topk_ckpt_map = []  # smaller index means better ckpt
         self.patience = self.config.patience
+        # optional: small set of latest scalar items to display in tqdm
+        self._last_postfix = {}
 
     @classmethod
     def to_device(cls, data, device):
@@ -118,7 +120,10 @@ class Trainer:
         if self.train_loader.sampler is not None and self.local_rank != -1:  # distributed
             self.train_loader.sampler.set_epoch(self.epoch)
         self._train_epoch_begin(device)
-        t_iter = tqdm(self.train_loader, ascii=True) if self._is_main_proc() else self.train_loader
+        t_iter = (
+            tqdm(self.train_loader, ascii=True, dynamic_ncols=True)
+            if self._is_main_proc() else self.train_loader
+        )
         for batch in t_iter:
             batch = self.to_device(batch, device)
             loss = self.train_step(batch, self.global_step)
@@ -145,7 +150,18 @@ class Trainer:
             self.log('Grad Norm', ori_grad_norm.cpu(), self.global_step)
             self.optimizer.step()
             if hasattr(t_iter, 'set_postfix'):
-                t_iter.set_postfix(loss=loss.item(), version=self.version)
+                postfix = {'loss': f'{loss.item():.4g}', 'ver': self.version}
+                # merge additional scalars if provided by subclass in the last step
+                try:
+                    for k, v in (self._last_postfix or {}).items():
+                        # keep short keys and compact numbers
+                        if isinstance(v, torch.Tensor):
+                            v = v.detach().float().cpu().item()
+                        if isinstance(v, (int, float)):
+                            postfix[k] = f'{v:.4g}'
+                except Exception:
+                    pass
+                t_iter.set_postfix(**postfix)
             self.global_step += 1
             if self.sched_freq == 'batch':
                 self.scheduler.step()
@@ -167,7 +183,10 @@ class Trainer:
         self.model.eval()
         self._valid_epoch_begin(device)
         with torch.no_grad():
-            t_iter = tqdm(self.valid_loader, ascii=True) if self._is_main_proc() else self.valid_loader
+            t_iter = (
+                tqdm(self.valid_loader, ascii=True, dynamic_ncols=True)
+                if self._is_main_proc() else self.valid_loader
+            )
             for batch in t_iter:
                 batch = self.to_device(batch, device)
                 metric = self.valid_step(batch, self.valid_global_step)

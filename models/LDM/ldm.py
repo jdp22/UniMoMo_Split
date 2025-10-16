@@ -28,7 +28,8 @@ class LDMMolDesign(nn.Module):
             h_loss_weight=None,
             std=10.0,
             is_aa_corrupt_ratio=0.1,
-            diffusion_opt={}
+            diffusion_opt={},
+            guide_opt=None,
         ):
         super().__init__()
         self.latent_deterministic = latent_deterministic
@@ -70,6 +71,34 @@ class LDMMolDesign(nn.Module):
         self.register_buffer('std', torch.tensor(std, dtype=torch.float))
         self.is_aa_corrupt_ratio = is_aa_corrupt_ratio
 
+        # Optional guidance: encode target subgraph(s) and inject into condition embedding
+        self._guide_enabled = False
+        self._guide_scale_default = 1.0
+        if guide_opt is not None:
+            try:
+                from ..modules.subgraph_encoder import Subgraph2DGNNEncoder
+                self._guide_encoder = Subgraph2DGNNEncoder(
+                    hidden_size=guide_opt.get('hidden_size', hidden_size),
+                    num_layers=guide_opt.get('num_layers', 3),
+                    atom_vocab_size=guide_opt.get('atom_vocab_size', 120),
+                    bond_vocab_size=guide_opt.get('bond_vocab_size', 5),
+                    readout=guide_opt.get('readout', 'mean')
+                )
+                self._guide_proj = nn.Linear(hidden_size, hidden_size)
+                self._guide_scale_default = guide_opt.get('scale', 1.0)
+                # cross-attention options
+                self._guide_cross_attention = bool(guide_opt.get('cross_attention', False))
+                self._guide_max_tokens = int(guide_opt.get('max_tokens', 16))
+                if self._guide_cross_attention:
+                    self._q_proj = nn.Linear(hidden_size, hidden_size)
+                    self._k_proj = nn.Linear(hidden_size, hidden_size)
+                    self._v_proj = nn.Linear(hidden_size, hidden_size)
+                    self._o_proj = nn.Linear(hidden_size, hidden_size)
+                self._guide_enabled = True
+            except Exception:
+                # Leave disabled if encoder cannot be constructed
+                self._guide_enabled = False
+
     @oom_decorator
     def forward(
             self,
@@ -84,6 +113,7 @@ class LDMMolDesign(nn.Module):
             block_lengths,  # [Nblock], number of atoms in each block
             lengths,        # [batch_size]
             is_aa,          # [Nblock], 1 for amino acid (for determining the X_mask in inverse folding)
+            **kwargs,
         ):
         '''
             L: [bs, 3, 3], cholesky decomposition of the covariance matrix \Sigma = LL^T
@@ -113,6 +143,52 @@ class LDMMolDesign(nn.Module):
 
         # condition embedding
         cond_embedding = self.cond_mlp(torch.cat([position_embedding, topo_embedding, is_aa_embedding], dim=-1))
+
+        # Optional training-time guidance: same interface as sampling
+        guide_frag_smiles = kwargs.get('guide_frag_smiles', None)
+        guide_scale = kwargs.get('guide_scale', self._guide_scale_default if hasattr(self, '_guide_scale_default') else 1.0)
+        if guide_frag_smiles is not None and getattr(self, '_guide_enabled', False):
+            try:
+                bs = lengths.shape[0]
+                # normalize to per-sample list
+                if isinstance(guide_frag_smiles, (list, tuple)) and len(guide_frag_smiles) and isinstance(guide_frag_smiles[0], str):
+                    guide_frag_smiles = [guide_frag_smiles for _ in range(bs)]
+
+                if getattr(self, '_guide_cross_attention', False):
+                    d_k = cond_embedding.shape[-1] ** 0.5
+                    for i in range(bs):
+                        frags = guide_frag_smiles[i]
+                        if not frags:
+                            continue
+                        g_tok = self._guide_encoder.encode_smiles_list(frags, device=cond_embedding.device)  # [m, C]
+                        if hasattr(self, '_guide_max_tokens') and g_tok.shape[0] > self._guide_max_tokens:
+                            idx = torch.randperm(g_tok.shape[0], device=g_tok.device)[: self._guide_max_tokens]
+                            g_tok = g_tok[idx]
+                        sel = (batch_ids == i)
+                        if not torch.any(sel):
+                            continue
+                        q = self._q_proj(cond_embedding[sel])
+                        k = self._k_proj(g_tok)
+                        v = self._v_proj(g_tok)
+                        attn = torch.softmax((q @ k.T) / d_k, dim=-1)
+                        guided = attn @ v
+                        cond_embedding[sel] = cond_embedding[sel] + guide_scale * self._o_proj(guided)
+                else:
+                    guide_vecs = []
+                    for frags in guide_frag_smiles:
+                        if frags is None or len(frags) == 0:
+                            guide_vecs.append(torch.zeros(cond_embedding.shape[-1], device=cond_embedding.device))
+                        else:
+                            g_emb = self._guide_encoder.encode_smiles_list(frags, device=cond_embedding.device)
+                            guide_vecs.append(g_emb.mean(dim=0))
+                    guide_vecs = torch.stack(guide_vecs, dim=0)  # [bs, C]
+                    guide_vecs = self._guide_proj(guide_vecs) * guide_scale
+                    cond_embedding = cond_embedding + guide_vecs[batch_ids]
+            except Exception:
+                pass
+
+        # Optional: inject guidance (training forward typically won't use this)
+        # Expect kwargs via a wrapper trainer (not provided) — leaving forward unmodified
 
         loss_dict = self.diffusion.forward(
             H_0=Zh,
@@ -238,7 +314,58 @@ class LDMMolDesign(nn.Module):
         
         # condition embedding
         cond_embedding = self.cond_mlp(torch.cat([position_embedding, topo_embedding, is_aa_embedding], dim=-1))
-        
+
+        # Guidance: add target fragment embeddings (if provided) to cond_embedding
+        # sample_opt may contain:
+        #   'guide_frag_smiles': List[List[str]] or List[str] (broadcast)
+        #   'guide_scale': float
+        guide_frag_smiles = sample_opt.pop('guide_frag_smiles', None)
+        guide_scale = sample_opt.pop('guide_scale', self._guide_scale_default if hasattr(self, '_guide_scale_default') else 1.0)
+        if guide_frag_smiles is not None and getattr(self, '_guide_enabled', False):
+            try:
+                # normalize to per-sample list
+                bs = lengths.shape[0]
+                if isinstance(guide_frag_smiles, (list, tuple)) and len(guide_frag_smiles) and isinstance(guide_frag_smiles[0], str):
+                    guide_frag_smiles = [guide_frag_smiles for _ in range(bs)]
+
+                if getattr(self, '_guide_cross_attention', False):
+                    # Cross-attention: per-sample token-level interaction
+                    d_k = cond_embedding.shape[-1] ** 0.5
+                    for i in range(bs):
+                        frags = guide_frag_smiles[i]
+                        if not frags:
+                            continue
+                        # encode tokens
+                        g_tok = self._guide_encoder.encode_smiles_list(frags, device=cond_embedding.device)  # [m, hidden]
+                        # limit number of tokens if too many
+                        if hasattr(self, '_guide_max_tokens') and g_tok.shape[0] > self._guide_max_tokens:
+                            idx = torch.randperm(g_tok.shape[0], device=g_tok.device)[: self._guide_max_tokens]
+                            g_tok = g_tok[idx]
+                        # select query blocks for this sample
+                        sel = (batch_ids == i)
+                        if not torch.any(sel):
+                            continue
+                        q = self._q_proj(cond_embedding[sel])                # [Ni, C]
+                        k = self._k_proj(g_tok)                              # [m, C]
+                        v = self._v_proj(g_tok)                              # [m, C]
+                        attn = torch.softmax((q @ k.T) / d_k, dim=-1)        # [Ni, m]
+                        guided = attn @ v                                    # [Ni, C]
+                        cond_embedding[sel] = cond_embedding[sel] + guide_scale * self._o_proj(guided)
+                else:
+                    # Vector injection: mean-pool the tokens and add
+                    guide_vecs = []
+                    for frags in guide_frag_smiles:
+                        if frags is None or len(frags) == 0:
+                            guide_vecs.append(torch.zeros(cond_embedding.shape[-1], device=cond_embedding.device))
+                        else:
+                            g_emb = self._guide_encoder.encode_smiles_list(frags, device=cond_embedding.device)  # [n, hidden]
+                            guide_vecs.append(g_emb.mean(dim=0))
+                    guide_vecs = torch.stack(guide_vecs, dim=0)  # [bs, hidden]
+                    guide_vecs = self._guide_proj(guide_vecs) * guide_scale
+                    cond_embedding = cond_embedding + guide_vecs[batch_ids]
+            except Exception:
+                pass
+
         traj = self.diffusion.sample(
             H=Zh,
             X=Zx,

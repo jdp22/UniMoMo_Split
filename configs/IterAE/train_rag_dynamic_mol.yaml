@@ -1,0 +1,181 @@
+dataset:
+  train:
+    - class: DynamicBatchWrapper
+      dataset:
+        class: ResidueFragmentWrapper
+        dataset:
+          class: MixDatasetWrapper
+          datasets:
+            - class: PeptideDataset
+              mmap_dir: ./datasets/peptide/pepbench/processed
+              specify_index: ./datasets/peptide/pepbench/processed/train_index.txt
+              cluster: ./datasets/peptide/pepbench/train.cluster
+            - class: PeptideDataset
+              mmap_dir: ./datasets/peptide/pepbench/processed
+              specify_index: ./datasets/peptide/pepbench/processed/non_standard_index.txt
+            - class: PeptideDataset
+              mmap_dir: ./datasets/peptide/ProtFrag/processed
+        storage_path: ./datasets/peptide/subgraphs_residue.train.jsonl
+        storage_min_heavy_atoms: 1
+        storage_metadata: true
+      complexity: n*n
+      ubound_per_batch: 12000000
+      n_use_max_in_batch: true
+    - class: DynamicBatchWrapper
+      dataset:
+        class: RAGBatchWrapper
+        dataset:
+          class: DynamicBlockWrapper
+          dataset:
+            class: MoleculeDataset
+            mmap_dir: ./datasets/molecule/CrossDocked/processed
+            specify_index: ./datasets/molecule/CrossDocked/processed/train_index.txt
+            length_type: atom
+          num_parts: [2, 3, 4]
+          seed: 1234
+          max_attempts: 5
+          storage_path: ./datasets/molecule/CrossDocked/subgraphs.dynamic.jsonl
+          min_heavy_atoms: [8, 6, 4]
+          storage_min_heavy_atoms: 8
+          storage_metadata: true
+        dynamic_partition:
+          num_parts: [2, 3, 4]
+          storage_path: ./datasets/molecule/CrossDocked/subgraphs.dynamic.jsonl
+          min_heavy_atoms: 8
+          seed: 1234
+          log_path: ./logs/rag_dynamic_partitions.train.jsonl
+      complexity: n*n
+      ubound_per_batch: 12000000
+      n_use_max_in_batch: true
+  valid:
+    - class: DynamicBatchWrapper
+      dataset:
+        class: ResidueFragmentWrapper
+        dataset:
+          class: PeptideDataset
+          mmap_dir: ./datasets/peptide/pepbench/processed
+          specify_index: ./datasets/peptide/pepbench/processed/valid_index.txt
+        storage_path: ./datasets/peptide/subgraphs_residue.valid.jsonl
+        storage_min_heavy_atoms: 1
+        storage_metadata: true
+      complexity: n*n
+      ubound_per_batch: 12000000
+      n_use_max_in_batch: true
+    - class: DynamicBatchWrapper
+      dataset:
+        class: RAGBatchWrapper
+        dataset:
+          class: DynamicBlockWrapper
+          dataset:
+            class: MoleculeDataset
+            mmap_dir: ./datasets/molecule/CrossDocked/processed
+            specify_index: ./datasets/molecule/CrossDocked/processed/valid_index.txt
+            length_type: atom
+          num_parts: [2, 3, 4]
+          seed: 5678
+          max_attempts: 5
+          storage_path: ./datasets/molecule/CrossDocked/subgraphs.dynamic.jsonl
+          min_heavy_atoms: [8, 6, 4]
+          storage_min_heavy_atoms: 8
+          storage_metadata: true
+        dynamic_partition:
+          num_parts: [2, 3, 4]
+          storage_path: ./datasets/molecule/CrossDocked/subgraphs.dynamic.jsonl
+          min_heavy_atoms: 8
+          seed: 5678
+          log_path: ./logs/rag_dynamic_partitions.valid.jsonl
+      complexity: n*n
+      ubound_per_batch: 12000000
+      n_use_max_in_batch: true
+
+dataloader:
+  train:
+    num_workers: 16
+  valid:
+    num_workers: 8
+
+trainer:
+  class: IterAETrainer
+  criterion: loss
+  config:
+    max_epoch: 50
+    save_topk: 5
+    val_freq: 2
+    save_dir: ./ckpts/unimomo_rag_dynamic
+    grad_clip: 1.0
+    patience: 10
+    warmup: 2000
+    metric_min_better: true
+    logger: tensorboard
+    optimizer:
+      class: AdamW
+      lr: 1.0e-4
+    scheduler:
+      class: ReduceLROnPlateau
+      factor: 0.8
+      patience: 5
+      mode: min
+      frequency: val_epoch
+      min_lr: 5.0e-6
+
+model:
+  class: CondIterAutoEncoder
+  encoder_type: EPT
+  decoder_type: EPT
+  embed_size: 512
+  hidden_size: 512
+  latent_size: 8
+  edge_size: 64
+  k_neighbors: 9
+  encoder_opt:
+    n_rbf: 64
+    cutoff: 10.0
+    n_layers: 6
+    n_head: 8
+    use_edge_feat: true
+    pre_norm: true
+    efficient: false
+    vector_act: layernorm
+  decoder_opt:
+    n_rbf: 64
+    cutoff: 10.0
+    n_layers: 6
+    n_head: 8
+    use_edge_feat: true
+    pre_norm: true
+    efficient: false
+    vector_act: layernorm
+  loss_weights:
+    Zh_kl_loss: 0.6            # KL on pocket latent (encoder)
+    Zx_kl_loss: 0.8            # KL on ligand latent (decoder)
+    atom_coord_loss: 1.0       # XYZ regression for generated atoms
+    block_type_loss: 0.0       # Optional block classification (unused when retrieval is strong)
+    contrastive_loss: 0.0      # Pocket-vs-ligand contrastive (disabled here)
+    local_distance_loss: 0.5   # Distance preservation for nearby atoms
+    bond_loss: 0.5             # Bond type classification
+    bond_length_loss: 0.0      # Bond length regularization
+    rag_contrastive_loss: 0.1  # 3D block vs 2D fragment InfoNCE (核心跨模态)
+    retrieval_loss: 0.0        # Fragment index cross-entropy (可选)
+  prior_coord_std: 1.0
+  coord_noise_scale: 1.0
+  pocket_mask_ratio: 0.05
+  decode_mask_ratio: 0.0
+  kl_on_pocket: false
+  discrete_timestep: false
+  rag_opt:
+    subgraph_index: ./datasets/molecule/CrossDocked/subgraphs.dynamic.jsonl  # 小分子 fragment JSONL
+    hidden_size: 512
+    num_layers: 3
+    temperature: 0.07
+    negatives_per_pos: 8
+    readout: mean
+    debug: true
+    strict_dynamic_pos: true
+    cross_modal_index: ./datasets/peptide/subgraphs_residue.train.jsonl      # 肽残基 fragment JSONL
+    cross_modal_neg_ratio: 0.3                                            # 跨模态负样本占比 (0-1)
+    zero_positive_log: ./logs/rag_zero_positive.jsonl
+    zero_detail_log: ./logs/rag_zero_positive_detail.jsonl
+    success_detail_log: ./logs/rag_positive_detail.jsonl
+    success_log_every: 1000  # 每隔 n 条成功记录写一次，控制日志体积
+    zero_log_every: 1000     # 每隔 n 条 zero-positive 记录写一次
+load_ckpt: ''
