@@ -379,6 +379,7 @@ class CondIterAutoEncoder(nn.Module):
         (3) assemble the different objectives (reconstruction, contrastive,
         retrieval).  Only the first part is shown here; the rest of the method
         follows the same structure with additional inline comments."""
+        #TODO: 简化device设定的逻辑
         dyn_block_lengths = kwargs.pop('dyn_block_lengths', None)
         dyn_block_types = kwargs.pop('dyn_block_types', None)
         dyn_generate_mask = kwargs.pop('dyn_generate_mask', None)

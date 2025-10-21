@@ -263,6 +263,10 @@ GPU=0,1,2,3,4,5,6,7 bash scripts/train_pipe.sh ./ckpts/unimomo ./configs/IterAE/
 
 **Dynamic fragment thresholds & logging.** Retrieval-aware runs (e.g. `configs/IterAE/train_rag_dynamic_mol.yaml`) now accept staged heavy-atom thresholds through `min_heavy_atoms`. You can provide a list such as `[8, 4]`; the wrapper first keeps fragments with ≥8 heavy atoms, and if that would drop all fragments it relaxes to ≥4. The sampler still honours `storage_min_heavy_atoms` (default `8`) when writing JSONLs so the fragment index only stores sizeable substructures. When `zero_detail_log` is set, every time the RAG contrastive loss observes zero positives the model appends a JSON line describing the sample, available fragments and diagnostic flags to the specified file. Setting `success_detail_log` mirrors this for successful batches so you can sanity-check which samples still yield positives. Retrieval will first draw in-batch negatives, then exclude-aware index samples, and finally fall back to global fragments so peptides can borrow small-molecule negatives if needed.
 
+**Summary-based source SMILES.** `RAGBatchWrapper` now falls back to the underlying dataset summaries when neither `rag_map_path` nor `dynamic_partition` is provided. The wrapper validates that `get_summary(idx).ref_seq` can be parsed as a SMILES (true for `MoleculeDataset`/`DynamicBlockWrapper` outputs) before using it, so peptide samples whose summaries contain amino-acid sequences remain unaffected. This lets you rely on a single `DynamicBlockWrapper` for dynamic fragment generation and JSONL storage, eliminating redundant RDKit work.
+
+**Validation without disk writes.** When you only need fragments during training, drop the `storage_path`/`log_path` fields from validation or test splits. With the summary fallback in place, evaluation loaders can operate without emitting fragment JSONLs or logs, which keeps validation runs read-only.
+
 **Inspecting fragment coverage.** Two utility scripts help troubleshoot the availability of positive fragments:
 
 ```bash

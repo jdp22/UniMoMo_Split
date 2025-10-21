@@ -30,6 +30,7 @@ from utils.subgraph_storage import _heavy_atom_count, SubgraphStorage
 
 class _DynamicFragmentSampler:
     def __init__(self, opt: Optional[dict]):
+        self.partition_log_path: Optional[str] = None
         if opt is None:
             self.enabled = False
             return
@@ -540,6 +541,10 @@ class RAGBatchWrapper(torch.utils.data.Dataset):
         import json
         self.dataset = R.recur_construct(dataset)
         self.dynamic_sampler = _DynamicFragmentSampler(dynamic_partition)
+        # Fallback flag: when no map or dynamic sampler is available we reuse dataset summaries.
+        self.use_summary_source = False
+        # Cache validated summary SMILES to avoid repeated RDKit parsing.
+        self._summary_smiles_cache: dict[str, Optional[str]] = {}
         if hasattr(self.dataset, 'set_partition_log_path') and self.dynamic_sampler.partition_log_path:
             try:
                 self.dataset.set_partition_log_path(self.dynamic_sampler.partition_log_path)
@@ -563,7 +568,10 @@ class RAGBatchWrapper(torch.utils.data.Dataset):
                         "pos_frag_smiles": rec.get("pos_frag_smiles", []),
                     }
         if not self.id2entry and not self.dynamic_sampler.enabled:
-            raise ValueError("RAGBatchWrapper requires either rag_map_path or dynamic_partition")
+            if hasattr(self.dataset, 'get_summary'):
+                self.use_summary_source = True
+            else:
+                raise ValueError("RAGBatchWrapper requires either rag_map_path or dynamic_partition")
 
     def __len__(self):
         return len(self.dataset)
@@ -586,11 +594,16 @@ class RAGBatchWrapper(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         data = self.dataset[idx]
         item_id = self.dataset.get_id(idx)
+        summary = self.dataset.get_summary(idx) if hasattr(self.dataset, 'get_summary') else None
         dynamic_entry = None
         if self.dynamic_sampler.enabled:
-            summary = self.dataset.get_summary(idx) if hasattr(self.dataset, 'get_summary') else None
             smiles = getattr(summary, 'ref_seq', None)
             dynamic_entry = self.dynamic_sampler.sample(smiles, metadata={'id': item_id})
+        elif self.use_summary_source and summary is not None:
+            smiles = self._extract_summary_smiles(summary)
+            if smiles:
+                # Mirror the dynamic sampler payload so downstream collate logic remains unchanged.
+                dynamic_entry = (smiles, None)
         return data, item_id, dynamic_entry
 
     def collate_fn(self, batch):
@@ -600,26 +613,46 @@ class RAGBatchWrapper(torch.utils.data.Dataset):
             data_list, id_list = zip(*batch)
             dyn_list = None
         base = self.dataset.collate_fn(list(data_list))
-        if self.dynamic_sampler.enabled and dyn_list is not None:
+        rag_src = None
+        if dyn_list is not None:
             rag_src = []
             for entry in dyn_list:
                 if entry is None:
                     rag_src.append(None)
                 else:
-                    src, frags = entry
+                    src, _ = entry
                     rag_src.append(src)
-            base["rag_source_smiles"] = rag_src
-        else:
+            if not any(rag_src):
+                rag_src = None
+        if rag_src is None:
             rag_src = []
             for _id in id_list:
                 rec = self.id2entry.get(_id, None)
                 if rec is None:
                     rag_src.append(None)
                 else:
-                    rag_src.append(rec["source_smiles"])
-            base["rag_source_smiles"] = rag_src
+                    rag_src.append(rec.get("source_smiles"))
+        base["rag_source_smiles"] = rag_src
         base['sample_ids'] = list(id_list)
         return base
+
+    def _extract_summary_smiles(self, summary) -> Optional[str]:
+        """Return canonical SMILES from summary when it represents a molecule."""
+        smiles = getattr(summary, 'ref_seq', None)
+        if not smiles or not isinstance(smiles, str):
+            return None
+        if smiles in self._summary_smiles_cache:
+            return self._summary_smiles_cache[smiles]
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+        except Exception:
+            mol = None
+        if mol is None:
+            self._summary_smiles_cache[smiles] = None
+            return None
+        canonical = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
+        self._summary_smiles_cache[smiles] = canonical
+        return canonical
 
 
 AA_ABRV_TO_ONE = {abrv: symbol for symbol, abrv in aas}

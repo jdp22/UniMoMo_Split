@@ -61,10 +61,21 @@ def clamp_coord(coord):
     return new_coord
 
 
-def generate_wrapper(model, sample_opt={}):
+def generate_wrapper(model, sample_opt=None):
     if isinstance(model, models.CondIterAutoEncoder):
         def wrapper(batch):
-            batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds = model.generate(**batch)
+            opt = dict(sample_opt) if sample_opt else {}
+            mode = opt.pop('mode', 'codesign')
+            fixseq = (mode == 'fixseq')
+            n_iter = int(opt.pop('n_iter', 10))
+            return_x_only = bool(opt.pop('return_x_only', False))
+            batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds = model.generate(
+                fixseq=fixseq,
+                n_iter=n_iter,
+                return_x_only=return_x_only,
+                **batch,
+                **opt
+            )
             return batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds
     elif isinstance(model, models.LDMMolDesign):# or isinstance(model, models.LFMMolDesign):
         def wrapper(batch):

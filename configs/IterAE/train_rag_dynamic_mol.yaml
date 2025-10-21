@@ -38,12 +38,6 @@ dataset:
           min_heavy_atoms: [8, 6, 4]
           storage_min_heavy_atoms: 8
           storage_metadata: true
-        dynamic_partition:
-          num_parts: [2, 3, 4]
-          storage_path: ./datasets/molecule/CrossDocked/subgraphs.dynamic.jsonl
-          min_heavy_atoms: 8
-          seed: 1234
-          log_path: ./logs/rag_dynamic_partitions.train.jsonl
       complexity: n*n
       ubound_per_batch: 12000000
       n_use_max_in_batch: true
@@ -78,12 +72,6 @@ dataset:
           min_heavy_atoms: [8, 6, 4]
           storage_min_heavy_atoms: 8
           storage_metadata: true
-        dynamic_partition:
-          num_parts: [2, 3, 4]
-          storage_path: ./datasets/molecule/CrossDocked/subgraphs.dynamic.jsonl
-          min_heavy_atoms: 8
-          seed: 5678
-          log_path: ./logs/rag_dynamic_partitions.valid.jsonl
       complexity: n*n
       ubound_per_batch: 12000000
       n_use_max_in_batch: true
@@ -163,7 +151,7 @@ model:
   kl_on_pocket: false
   discrete_timestep: false
   rag_opt:
-    subgraph_index: ./datasets/molecule/CrossDocked/subgraphs.dynamic.jsonl  # 小分子 fragment JSONL
+    subgraph_index: ./datasets/molecule/CrossDocked/subgraphs.dynamic.sample5k.jsonl  # 小分子 fragment JSONL
     hidden_size: 512
     num_layers: 3
     temperature: 0.07
