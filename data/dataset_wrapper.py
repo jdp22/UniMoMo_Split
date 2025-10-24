@@ -47,6 +47,7 @@ class _DynamicFragmentSampler:
         self.log_every = max(1, opt.get('log_every', 1))
         # Optional: record each sampled partition so we can audit fragment coverage later.
         self.partition_log_path = opt.get('log_path')
+        self._seed_schedule: tuple[int, ...] = (1, 12, 123, 1234, 12345)
         self._sample_counter = 0
         self._seen_fragments: set[str] = set()
         self._storage_initialized = False
@@ -165,6 +166,19 @@ class _DynamicFragmentSampler:
                         pass
                 handle.close()
 
+
+class FragmentPartitionFailure(RuntimeError):
+    """Internal signal indicating partition strategies exhausted."""
+
+
+class FragmentPartitionError(RuntimeError):
+    def __init__(self, message: str, *, dataset_index: int, item_id: Optional[str] = None,
+                 smiles: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.dataset_index = dataset_index
+        self.item_id = item_id
+        self.smiles = smiles
+
     def sample(self, smiles: Optional[str], metadata):
         if not self.enabled or not smiles:
             return None, []
@@ -181,14 +195,15 @@ class _DynamicFragmentSampler:
         canonical = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
         attempts = 0
         partitions = None
-        while attempts < 5:
+        max_trials = max(1, len(self._seed_schedule))
+        while attempts < max_trials:
             attempts += 1
             num_parts = self._choose_num_parts(mol)
             try:
                 partitions = random_subgraph_partition(
                     mol,
                     num_parts,
-                    seed=self.random.randint(0, 10**9),
+                    seed=self._seed_schedule[(attempts - 1) % len(self._seed_schedule)],
                 )
                 break
             except ValueError:
@@ -444,6 +459,11 @@ class DynamicBatchWrapper(torch.utils.data.Dataset):
     ########## overload with your criterion ##########
     def _form_batch(self):
 
+        self.indexes = [i for i in range(len(self.dataset))]
+        if not self.indexes:
+            self.batch_indexes = []
+            self.total_size = 0
+            return
         np.random.shuffle(self.indexes)
         last_batch_indexes = self.batch_indexes
         self.batch_indexes = []
@@ -503,21 +523,31 @@ class DynamicBatchWrapper(torch.utils.data.Dataset):
                 batch.append(i)
             self.batch_indexes.append(batch)    # last batch
 
-        if self.total_size is None:
-            self.total_size = len(self.batch_indexes)
-        else:
-            # control the lengths of the dataset, otherwise the dataloader will raise error
-            if len(self.batch_indexes) < self.total_size:
-                num_add = self.total_size - len(self.batch_indexes)
-                self.batch_indexes = self.batch_indexes + last_batch_indexes[:num_add]
-            else:
-                self.batch_indexes = self.batch_indexes[:self.total_size]
+        self.total_size = len(self.batch_indexes)
 
     def __len__(self):
         return len(self.batch_indexes)
     
     def __getitem__(self, idx):
-        return [self.dataset[i] for i in self.batch_indexes[idx]]
+        while True:
+            if not self.batch_indexes:
+                raise RuntimeError('DynamicBatchWrapper has no valid batches')
+            if idx >= len(self.batch_indexes):
+                idx = idx % len(self.batch_indexes)
+            batch = []
+            failed = False
+            for i in self.batch_indexes[idx]:
+                try:
+                    batch.append(self.dataset[i])
+                except FragmentPartitionError:
+                    failed = True
+                    break
+            if not failed:
+                return batch
+            # dataset removed an invalid sample; rebuild batches and retry
+            self._form_batch()
+            if idx >= len(self.batch_indexes):
+                idx = 0
     
     def collate_fn(self, batched_batch):
         batch = []
@@ -579,12 +609,20 @@ class RAGBatchWrapper(torch.utils.data.Dataset):
     def get_id(self, idx):
         if hasattr(self.dataset, 'get_id'):
             return self.dataset.get_id(idx)
-        raise AttributeError('DynamicBlockWrapper underlying dataset lacks get_id')
+        raise AttributeError('RAGBatchWrapper underlying dataset lacks get_id')
 
     def get_summary(self, idx):
         if hasattr(self.dataset, 'get_summary'):
             return self.dataset.get_summary(idx)
         return None
+
+    def get_raw_data(self, idx):
+        if hasattr(self.dataset, 'get_raw_data'):
+            base = self.dataset.get_raw_data(idx)
+            if isinstance(base, dict) and '_base_data' in base:
+                return base['_base_data']
+            return base
+        raise AttributeError('RAGBatchWrapper underlying dataset lacks get_raw_data')
 
     def get_len(self, idx):
         if hasattr(self.dataset, 'get_len'):
@@ -672,12 +710,32 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
             storage_min_heavy_atoms: int = 1,
             storage_metadata: bool = True,
             min_heavy_atoms: Optional[Sequence[int]] = None,
+            min_fragment_atoms: Optional[int] = None,
+            invalid_log_path: Optional[str] = None,
+            allow_single_fragment_fallback: bool = False,
+            fallback_max_heavy_atoms: Optional[int] = None,
+            partition_seeds: Optional[Sequence[int]] = None,
         ) -> None:
         super().__init__()
         self.dataset = R.recur_construct(dataset)
         self.num_parts = num_parts
         self.max_attempts = max(1, max_attempts)
         self.random = random.Random(seed)
+        if partition_seeds is None:
+            seeds = (7801, 1, 12, 123, 1234, 12345, 114514)
+        else:
+            unique: list[int] = []
+            for value in partition_seeds:
+                try:
+                    seed_value = int(value)
+                except Exception:
+                    continue
+                if seed_value not in unique:
+                    unique.append(seed_value)
+            if not unique:
+                unique = [7801, 1, 12, 123, 1234, 12345, 114514]
+            seeds = tuple(unique)
+        self._partition_seeds: tuple[int, ...] = seeds
         self.block_dummy_idx = VOCAB.get_block_dummy_idx()
         self.storage = None
         self.storage_metadata = storage_metadata
@@ -686,32 +744,63 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
         # heavy-atom requirement instead of returning an empty fragment set. Values
         # are clamped to non-negative integers to avoid unexpected behaviour.
         if isinstance(min_heavy_atoms, (list, tuple)):
-            seq = [max(0, int(v)) for v in min_heavy_atoms if v is not None]
+            seq_raw = [v for v in min_heavy_atoms if v is not None]
         elif min_heavy_atoms is None:
-            seq = []
+            seq_raw = []
         else:
-            seq = [max(0, int(min_heavy_atoms))]
-        self.min_heavy_atom_thresholds = seq if seq else [0]
+            seq_raw = [min_heavy_atoms]
+
+        if seq_raw:
+            seq_unique = sorted({max(0, int(v)) for v in seq_raw}, reverse=True)
+            self.min_heavy_atom_thresholds = seq_unique
+        else:
+            self.min_heavy_atom_thresholds = [0]
         if storage_path is not None:
             self.storage = SubgraphStorage(storage_path, min_heavy_atoms=storage_min_heavy_atoms)
+        self._min_fragment_atoms_value: Optional[int] = None
+        self._invalid_log_path = invalid_log_path
+        self._invalid_count = 0
+        self._active_indices: List[int] = list(range(len(self.dataset)))
+        self.allow_single_fragment_fallback = allow_single_fragment_fallback
+        self._fallback_max_heavy_atoms = None if fallback_max_heavy_atoms is None else max(0, int(fallback_max_heavy_atoms))
+
+    def _max_trials(self) -> int:
+        return len(self._partition_seeds) if self._partition_seeds else max(1, self.max_attempts)
 
     def __len__(self):
-        return len(self.dataset)
+        return len(self._active_indices)
+
+    def _resolve_index(self, idx: int) -> int:
+        if idx < 0 or idx >= len(self._active_indices):
+            raise IndexError(idx)
+        return self._active_indices[idx]
 
     def get_len(self, idx):
+        base_idx = self._resolve_index(idx)
         if hasattr(self.dataset, 'get_len'):
-            return self.dataset.get_len(idx)
+            return self.dataset.get_len(base_idx)
         raise AttributeError('DynamicBlockWrapper underlying dataset lacks get_len')
 
     def get_id(self, idx):
+        base_idx = self._resolve_index(idx)
         if hasattr(self.dataset, 'get_id'):
-            return self.dataset.get_id(idx)
+            return self.dataset.get_id(base_idx)
         raise AttributeError('DynamicBlockWrapper underlying dataset lacks get_id')
 
     def get_summary(self, idx):
+        base_idx = self._resolve_index(idx)
         if hasattr(self.dataset, 'get_summary'):
-            return self.dataset.get_summary(idx)
+            return self.dataset.get_summary(base_idx)
         return None
+
+    def get_raw_data(self, idx):
+        base_idx = self._resolve_index(idx)
+        if hasattr(self.dataset, 'get_raw_data'):
+            base = self.dataset.get_raw_data(base_idx)
+            if isinstance(base, dict) and '_base_data' in base:
+                return base['_base_data']
+            return base
+        raise AttributeError('DynamicBlockWrapper underlying dataset lacks get_raw_data')
 
     def set_partition_log_path(self, path: Optional[str]) -> None:
         self.partition_log_path = path
@@ -723,6 +812,11 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
             choice = int(self.random.choice(self.num_parts))
             return max(1, min(choice, ligand_atoms))
         return 1
+
+    def _partition_seed(self, attempt_idx: int) -> int:
+        if not self._partition_seeds:
+            return self.random.randint(0, 2**32 - 1)
+        return self._partition_seeds[attempt_idx % len(self._partition_seeds)]
 
     def _log_partitions(
             self,
@@ -790,9 +884,21 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
                 handle.close()
 
     def __getitem__(self, idx: int):
-        data = self.dataset[idx]
-        summary = self.dataset.get_summary(idx) if hasattr(self.dataset, 'get_summary') else None
-        dyn_info = self._build_dynamic_blocks(data, summary)
+        base_idx = self._resolve_index(idx)
+        data = self.dataset[base_idx]
+        summary = self.dataset.get_summary(base_idx) if hasattr(self.dataset, 'get_summary') else None
+        item_id = self.dataset.get_id(base_idx) if hasattr(self.dataset, 'get_id') else None
+        try:
+            dyn_info = self._build_dynamic_blocks(data, summary)
+        except FragmentPartitionFailure as exc:
+            smiles = getattr(summary, 'ref_seq', None) if summary is not None else None
+            self._mark_invalid(idx, item_id, smiles, str(exc))
+            raise FragmentPartitionError(
+                f"Failed to partition sample {item_id or base_idx}: {exc}",
+                dataset_index=idx,
+                item_id=item_id,
+                smiles=smiles,
+            ) from exc
         if isinstance(data, dict):
             data = dict(data)
             data['_dyn_info'] = dyn_info
@@ -800,6 +906,32 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
             # fall back: wrap into dict-like structure
             data = {'_base_data': data, '_dyn_info': dyn_info}
         return data
+
+    def _mark_invalid(self, position: int, item_id: Optional[str], smiles: Optional[str], reason: str) -> None:
+        if position < 0 or position >= len(self._active_indices):
+            return
+        base_idx = self._active_indices.pop(position)
+        self._invalid_count += 1
+        record = {
+            'index': int(base_idx),
+            'item_id': item_id,
+            'smiles': smiles,
+            'reason': reason,
+        }
+        self._write_invalid_log(record)
+
+    def _write_invalid_log(self, record: dict) -> None:
+        if not self._invalid_log_path:
+            return
+        try:
+            os.makedirs(os.path.dirname(self._invalid_log_path), exist_ok=True)
+        except Exception:
+            pass
+        try:
+            with open(self._invalid_log_path, 'a', encoding='utf-8') as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + '\n')
+        except Exception:
+            pass
 
     def _build_dynamic_blocks(self, data: dict, summary) -> dict:
         block_lengths = data['block_lengths'].long()
@@ -834,6 +966,8 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
                 mol = None
         if mol is not None and num_ligand_atoms > 0:
             candidate_parts: List[int]
+            min_fragment_atoms = self._min_fragment_atoms()
+            total_atoms = mol.GetNumAtoms()
             if isinstance(self.num_parts, int):
                 candidate_parts = [self.num_parts]
             elif isinstance(self.num_parts, (list, tuple)):
@@ -843,18 +977,20 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
             if 2 not in candidate_parts:
                 candidate_parts.append(2)
             candidate_parts = [min(int(p), num_ligand_atoms) for p in candidate_parts if int(p) > 0]
-            candidate_parts = [p for p in candidate_parts if p >= 1]
+            candidate_parts = [p for p in candidate_parts if p >= 2]
+            if min_fragment_atoms > 0:
+                candidate_parts = [
+                    p for p in candidate_parts
+                    if total_atoms >= p * min_fragment_atoms
+                ]
             if not candidate_parts:
-                candidate_parts = [1]
-            attempts = 0
-            max_trials = max(self.max_attempts, 1)
-            for requested in candidate_parts:
+                candidate_parts = [2] if total_atoms >= 2 else []
+            max_trials = self._max_trials()
+            for candidate_idx, requested in enumerate(candidate_parts):
                 if requested <= 0:
                     continue
-                trials = 0
-                while trials < max_trials:
-                    trials += 1
-                    seed = self.random.randint(0, 2**32 - 1)
+                for trial in range(max_trials):
+                    seed = self._partition_seed(candidate_idx * max_trials + trial)
                     try:
                         partitions = random_subgraph_partition(mol, num_partitions=requested, seed=seed)
                     except ValueError:
@@ -868,8 +1004,6 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
                             break
                         partitions = None
                         frag_smiles_list = None
-                if partitions and len(partitions) > 1:
-                    break
         if mol is not None and num_ligand_atoms > 0:
             if not partitions or len(partitions) <= 1 or not frag_smiles_list or len(frag_smiles_list) < len(partitions):
                 fallback = self._fallback_partitions_from_blocks(
@@ -885,9 +1019,19 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
                         frag_smiles_list = None
         if mol is not None and num_ligand_atoms > 0:
             if (not partitions or len(partitions) <= 1) and num_ligand_atoms > 1:
-                connected = self._connected_partition(mol, min(2, num_ligand_atoms), self.random.randint(0, 2**32 - 1))
-                if connected and len(connected) > 1:
-                    partitions = connected
+                for trial in range(max_trials):
+                    seed = self._partition_seed(trial)
+                    connected = self._connected_partition(mol, min(2, num_ligand_atoms), seed)
+                    if not connected or len(connected) <= 1:
+                        continue
+                    try:
+                        frag_smiles_list = fragment_smiles_for_partitions(mol, connected)
+                    except Exception:
+                        frag_smiles_list = None
+                    if frag_smiles_list and len(frag_smiles_list) == len(connected):
+                        partitions = connected
+                        break
+                if partitions is not None and len(partitions) > 1 and (not frag_smiles_list or len(frag_smiles_list) != len(partitions)):
                     try:
                         frag_smiles_list = fragment_smiles_for_partitions(mol, partitions)
                     except Exception:
@@ -927,6 +1071,16 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
                 partitions = original_partitions
                 frag_smiles_list = original_smiles
 
+        if mol is not None and partitions:
+            partitions, frag_smiles_list = self._ensure_partition_quality(
+                mol,
+                partitions,
+                list(frag_smiles_list) if frag_smiles_list is not None else None,
+                ligand_block_indices,
+                block_offsets,
+                ligand_atom_indices,
+            )
+
         if mol is not None and 'original_partitions' in locals():
             self._log_partitions(
                 mol,
@@ -946,6 +1100,7 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
                 pass
 
         ligand_atom_indices_list = ligand_atom_indices.tolist()
+        rdkit_index_map = {global_idx: rdkit_idx for rdkit_idx, global_idx in enumerate(ligand_atom_indices_list)}
         mapped_partitions: List[List[int]] = []
         for part in partitions:
             mapped = [ligand_atom_indices_list[idx] for idx in part if idx < len(ligand_atom_indices_list)]
@@ -1002,7 +1157,20 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
             dyn_chain_ids.append(ligand_chain_id)
             dyn_position_ids.append(0)
             dyn_is_aa.append(False)
-            dyn_fragment_smiles.append(None)
+            single_smiles = None
+            if mol is not None:
+                rdkit_idx = rdkit_index_map.get(atom_idx)
+                if rdkit_idx is not None:
+                    try:
+                        single_smiles = Chem.MolFragmentToSmiles(
+                            mol,
+                            atomsToUse=[rdkit_idx],
+                            canonical=True,
+                            isomericSmiles=True,
+                        )
+                    except Exception:
+                        single_smiles = None
+            dyn_fragment_smiles.append(single_smiles)
             current_idx += 1
 
         dyn = {
@@ -1140,6 +1308,259 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
                 partitions.setdefault(part_id, []).append(atom_idx)
         ordered = [sorted(set(group)) for _, group in sorted(partitions.items()) if group]
         return ordered
+
+    def _min_fragment_atoms(self) -> int:
+        if getattr(self, '_min_fragment_atoms_value', None) is not None:
+            return int(self._min_fragment_atoms_value)
+        if self.min_heavy_atom_thresholds:
+            positive = [int(v) for v in self.min_heavy_atom_thresholds if v]
+            if positive:
+                return max(2, min(positive))
+        return 2
+
+    def _fragments_valid(self, frag_smiles_list: Optional[Sequence[Optional[str]]], min_atoms: int) -> bool:
+        if not frag_smiles_list:
+            return False
+        if len(frag_smiles_list) < 2:
+            return False
+        for smi in frag_smiles_list:
+            if not smi:
+                return False
+            try:
+                mol = Chem.MolFromSmiles(smi)
+            except Exception:
+                mol = None
+            if mol is None or mol.GetNumAtoms() < min_atoms:
+                return False
+        return True
+
+    def _random_partitions(self, mol: Chem.Mol, num_parts: int) -> Optional[List[List[int]]]:
+        num_parts = max(2, min(num_parts, mol.GetNumAtoms()))
+        max_trials = self._max_trials()
+        for attempt in range(max_trials):
+            seed = self._partition_seed(attempt)
+            try:
+                partitions = random_subgraph_partition(mol, num_partitions=num_parts, seed=seed)
+            except ValueError:
+                partitions = None
+            if partitions and len(partitions) >= 2:
+                return partitions
+        return None
+
+    def _sequential_partitions(self, num_atoms: int, num_parts: int) -> List[List[int]]:
+        if num_atoms <= 1:
+            return [list(range(num_atoms))]
+        num_parts = max(2, min(num_parts, num_atoms))
+        base = num_atoms // num_parts
+        remainder = num_atoms % num_parts
+        partitions: List[List[int]] = []
+        start = 0
+        for idx in range(num_parts):
+            length = base + (1 if idx < remainder else 0)
+            if length <= 0:
+                continue
+            end = start + length
+            partitions.append(list(range(start, end)))
+            start = end
+        if start < num_atoms and partitions:
+            partitions[-1].extend(range(start, num_atoms))
+        if not partitions:
+            partitions = [list(range(num_atoms))]
+        return partitions
+
+    def _merge_small_partitions(self, mol: Chem.Mol, partitions: List[List[int]], min_atoms: int) -> List[List[int]]:
+        if min_atoms <= 1 or len(partitions) <= 1:
+            return partitions
+        partitions = [sorted(set(part)) for part in partitions if part]
+        if len(partitions) <= 1:
+            return partitions
+
+        atom_to_part = {}
+        for idx, part in enumerate(partitions):
+            for atom in part:
+                atom_to_part[atom] = idx
+
+        changed = True
+        while changed:
+            changed = False
+            small_idx = None
+            for idx, part in enumerate(partitions):
+                if len(part) < min_atoms:
+                    small_idx = idx
+                    break
+            if small_idx is None or len(partitions) <= 1:
+                break
+
+            small_part = partitions[small_idx]
+            neighbor_scores = {}
+            for atom in small_part:
+                atom_obj = mol.GetAtomWithIdx(atom)
+                for nbr in atom_obj.GetNeighbors():
+                    nbr_idx = nbr.GetIdx()
+                    target_part = atom_to_part.get(nbr_idx)
+                    if target_part is None or target_part == small_idx:
+                        continue
+                    neighbor_scores[target_part] = neighbor_scores.get(target_part, 0) + 1
+
+            if neighbor_scores:
+                target_idx = max(neighbor_scores.items(), key=lambda kv: (kv[1], -len(partitions[kv[0]])))[0]
+            else:
+                if small_idx > 0:
+                    target_idx = small_idx - 1
+                elif small_idx + 1 < len(partitions):
+                    target_idx = small_idx + 1
+                else:
+                    target_idx = None
+            if target_idx is None:
+                break
+
+            merged = sorted(set(partitions[target_idx]) | set(small_part))
+            partitions[target_idx] = merged
+            partitions.pop(small_idx)
+
+            atom_to_part.clear()
+            for idx, part in enumerate(partitions):
+                for atom in part:
+                    atom_to_part[atom] = idx
+            changed = True
+
+        return partitions
+
+    def _ensure_partition_quality(
+            self,
+            mol: Optional[Chem.Mol],
+            partitions: Optional[List[List[int]]],
+            frag_smiles_list: Optional[List[Optional[str]]],
+            ligand_block_indices,
+            block_offsets,
+            ligand_atom_indices,
+        ) -> tuple[List[List[int]], List[Optional[str]]]:
+        min_atoms = self._min_fragment_atoms()
+
+        if mol is None or mol.GetNumAtoms() == 0:
+            raise FragmentPartitionFailure("Molecule has no atoms for partitioning")
+        if partitions is None or len(partitions) == 0:
+            partitions = []
+        if self._fragments_valid(frag_smiles_list, min_atoms):
+            return partitions, list(frag_smiles_list)
+
+        num_atoms = mol.GetNumAtoms()
+        candidate_parts: List[int] = []
+        if isinstance(self.num_parts, int):
+            candidate_parts.append(int(self.num_parts))
+        elif isinstance(self.num_parts, (list, tuple)):
+            for item in self.num_parts:
+                if isinstance(item, (int, float)) and item:
+                    candidate_parts.append(int(item))
+        candidate_parts.extend([num_atoms, max(2, num_atoms // 2), 4, 3, 2])
+        candidate_parts = [
+            max(2, min(num_atoms, part))
+            for part in candidate_parts
+            if isinstance(part, int) and part >= 2
+        ]
+        candidate_parts = sorted(set(candidate_parts), reverse=True)
+        thresholds = [
+            int(v)
+            for v in self.min_heavy_atom_thresholds
+            if isinstance(v, (int, float)) and v >= 0
+        ]
+        if not thresholds:
+            thresholds = [0]
+        thresholds = sorted(set(thresholds), reverse=True)
+        thresholds_positive = [t for t in thresholds if t > 0]
+        loop_thresholds = thresholds_positive if thresholds_positive else thresholds
+
+        max_trials = self._max_trials()
+        seed_counter = 0
+
+        def attempt_with_threshold(num_part: int, threshold: int):
+            nonlocal seed_counter
+            if threshold > 0 and num_atoms < threshold * num_part:
+                return None
+            prev_min = self._min_fragment_atoms_value
+            min_atoms_local = max(1, threshold)
+            self._min_fragment_atoms_value = min_atoms_local
+            try:
+                # random partitions
+                for _ in range(max_trials):
+                    seed = self._partition_seed(seed_counter)
+                    seed_counter += 1
+                    try:
+                        candidate = random_subgraph_partition(mol, num_partitions=num_part, seed=seed)
+                    except ValueError:
+                        candidate = None
+                    if not candidate or len(candidate) <= 1:
+                        continue
+                    frag = fragment_smiles_for_partitions(mol, candidate)
+                    if not self._fragments_valid(frag, min_atoms_local):
+                        continue
+                    candidate = self._merge_small_partitions(mol, candidate, min_atoms_local)
+                    frag = fragment_smiles_for_partitions(mol, candidate)
+                    if self._fragments_valid(frag, min_atoms_local):
+                        return candidate, frag
+
+                # fallback based on existing ligand blocks
+                fallback_blocks = self._fallback_partitions_from_blocks(
+                    ligand_block_indices,
+                    block_offsets,
+                    ligand_atom_indices,
+                )
+                if fallback_blocks:
+                    frag = fragment_smiles_for_partitions(mol, fallback_blocks)
+                    if self._fragments_valid(frag, min_atoms_local):
+                        fallback_blocks = self._merge_small_partitions(mol, fallback_blocks, min_atoms_local)
+                        frag = fragment_smiles_for_partitions(mol, fallback_blocks)
+                        if self._fragments_valid(frag, min_atoms_local):
+                            return fallback_blocks, frag
+
+                # connected partition fallback
+                for _ in range(max_trials):
+                    seed = self._partition_seed(seed_counter)
+                    seed_counter += 1
+                    connected = self._connected_partition(mol, num_part, seed)
+                    if not connected or len(connected) <= 1:
+                        continue
+                    frag = fragment_smiles_for_partitions(mol, connected)
+                    if not self._fragments_valid(frag, min_atoms_local):
+                        continue
+                    connected = self._merge_small_partitions(mol, connected, min_atoms_local)
+                    frag = fragment_smiles_for_partitions(mol, connected)
+                    if self._fragments_valid(frag, min_atoms_local):
+                        return connected, frag
+
+                # sequential fallback with requested block count
+                sequential = self._sequential_partitions(num_atoms, num_part)
+                if sequential:
+                    frag = fragment_smiles_for_partitions(mol, sequential)
+                    if self._fragments_valid(frag, min_atoms_local):
+                        sequential = self._merge_small_partitions(mol, sequential, min_atoms_local)
+                        frag = fragment_smiles_for_partitions(mol, sequential)
+                    if self._fragments_valid(frag, min_atoms_local):
+                        return sequential, frag
+            finally:
+                self._min_fragment_atoms_value = prev_min
+            return None
+
+        for num_part in candidate_parts:
+            for threshold in loop_thresholds:
+                result = attempt_with_threshold(num_part, threshold)
+                if result is not None:
+                    return result
+
+        fallback_limit = None
+        if self._fallback_max_heavy_atoms is not None:
+            fallback_limit = int(self._fallback_max_heavy_atoms)
+        elif thresholds_positive:
+            fallback_limit = min(thresholds_positive) * 3 + 3
+
+        if self.allow_single_fragment_fallback and mol is not None and fallback_limit is not None:
+            heavy_atoms = mol.GetNumAtoms()
+            if heavy_atoms <= fallback_limit:
+                partitions = [list(range(heavy_atoms))]
+                frag = [Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)]
+                return partitions, frag
+
+        raise FragmentPartitionFailure("Unable to produce fragment partitions that satisfy constraints")
 
 
 @R.register('GuideBatchWrapper')

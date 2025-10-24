@@ -40,6 +40,13 @@ def main(args, opt_args):
     print_log(f'Loading config from {args.config} ...')
     config = yaml.safe_load(open(args.config, 'r'))
     config = overwrite_values(config, opt_args)
+    if config.get('rdkit_disable_log', False):
+        try:
+            from rdkit import RDLogger
+            RDLogger.DisableLog('rdApp.*')
+            print_log('RDKit logging disabled', level='DEBUG')
+        except Exception as exc:
+            print_log(f'Failed to disable RDKit logging: {exc}', level='WARN')
     print_log(f'Config loaded in {time.time() - t0:.2f}s')
 
     ########## define your model #########

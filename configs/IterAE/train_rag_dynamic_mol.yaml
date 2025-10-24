@@ -1,3 +1,5 @@
+rdkit_disable_log: true
+
 dataset:
   train:
     - class: DynamicBatchWrapper
@@ -31,11 +33,14 @@ dataset:
             mmap_dir: ./datasets/molecule/CrossDocked/processed
             specify_index: ./datasets/molecule/CrossDocked/processed/train_index.txt
             length_type: atom
-          num_parts: [2, 3, 4]
+          num_parts: [5,4,3,2]
           seed: 1234
           max_attempts: 5
           storage_path: ./datasets/molecule/CrossDocked/subgraphs.dynamic.jsonl
           min_heavy_atoms: [8, 6, 4]
+          fallback_max_heavy_atoms: 40
+          allow_single_fragment_fallback: true
+          invalid_log_path: ./logs/invalid_dynamic_fragments.train.jsonl
           storage_min_heavy_atoms: 8
           storage_metadata: true
       complexity: n*n
@@ -70,6 +75,8 @@ dataset:
           max_attempts: 5
           storage_path: ./datasets/molecule/CrossDocked/subgraphs.dynamic.jsonl
           min_heavy_atoms: [8, 6, 4]
+          min_fragment_atoms: 4
+          invalid_log_path: ./logs/invalid_dynamic_fragments.valid.jsonl
           storage_min_heavy_atoms: 8
           storage_metadata: true
       complexity: n*n
@@ -155,12 +162,12 @@ model:
     hidden_size: 512
     num_layers: 3
     temperature: 0.07
-    negatives_per_pos: 8
+    negatives_per_pos: 5
     readout: mean
     debug: true
     strict_dynamic_pos: true
-    cross_modal_index: ./datasets/peptide/subgraphs_residue.train.jsonl      # 肽残基 fragment JSONL
-    cross_modal_neg_ratio: 0.3                                            # 跨模态负样本占比 (0-1)
+    cross_modal_index: ./datasets/peptide/subgraphs_residue.sample5k.jsonl      # 肽残基 fragment JSONL (downsampled)
+    cross_modal_neg_ratio: 1                                          # 跨模态负样本占比 (0-1)
     zero_positive_log: ./logs/rag_zero_positive.jsonl
     zero_detail_log: ./logs/rag_zero_positive_detail.jsonl
     success_detail_log: ./logs/rag_positive_detail.jsonl

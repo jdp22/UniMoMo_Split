@@ -1,6 +1,8 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
 import json
+import os
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -192,6 +194,7 @@ class CondIterAutoEncoder(nn.Module):
         super().__init__()
         self.encoder = create_net(encoder_type, hidden_size, edge_size, encoder_opt)
         self.decoder = create_net(decoder_type, hidden_size, edge_size, decoder_opt)
+        self.hidden_size = hidden_size
 
         # --- Core parameterisations shared by encoder/decoder ---
         self.embedding = BlockEmbedding(num_block_type, num_atom_type, embed_size)
@@ -252,7 +255,6 @@ class CondIterAutoEncoder(nn.Module):
         self.rag_cross_index = None
         self.rag_cross_modal_neg_ratio = 0.0
         self.rag_strict_dynamic_pos = False
-
         if rag_opt is not None and isinstance(rag_opt, dict):
             # Configure the optional 2D fragment encoder and negative sampling indexes.
             # The try/except ensures training keeps running even if RDKit/subgraph
@@ -310,6 +312,36 @@ class CondIterAutoEncoder(nn.Module):
                 print_log(f"[RAG] disabled due to exception: {exc}", level='WARN')
                 self.rag_enabled = False
 
+        # Fragment retrieval pools used during generation
+        default_mol_index = None
+        default_peptide_index = None
+        if isinstance(rag_opt, dict):
+            default_mol_index = rag_opt.get('subgraph_index', None)
+            default_peptide_index = rag_opt.get('cross_modal_index', None)
+        self.fragment_fallback_paths = {
+            'molecule': [],
+            'peptide': []
+        }
+        fallback_defaults = {
+            'molecule': [default_mol_index, './datasets/molecule/CrossDocked/subgraphs.dynamic.sample5k.jsonl'],
+            'peptide': [default_peptide_index, './datasets/peptide/subgraphs_residue.train.jsonl'],
+        }
+        for key, candidates in fallback_defaults.items():
+            dedup: List[str] = []
+            seen = set()
+            for path in candidates:
+                if not path:
+                    continue
+                normalized = os.path.abspath(path)
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                dedup.append(normalized)
+            self.fragment_fallback_paths[key] = dedup
+        self._fragment_pool_cache: dict[str, List[str]] = {}
+        self.generate_negatives_per_block = 8
+        self._fragment_emb_cache: dict[str, torch.Tensor] = {}
+
         # --- Dynamic fragment retrieval index (separate from RAG) ---
         self.retrieval_enabled = False
         self.retrieval_temperature = 0.07
@@ -354,6 +386,109 @@ class CondIterAutoEncoder(nn.Module):
             self._buffers['contrastive_queue_x'] = queue_x.detach()
             self._buffers['contrastive_queue_y'] = queue_y.detach()
 
+    def _decode_block_hidden(self, Zh, Zx, chain_ids, lengths):
+        batch_ids = length_to_batch_id(lengths)
+        latent_block_ids = torch.ones_like(batch_ids).cumsum(dim=-1) - 1
+        edges, edge_type = self.get_edges(batch_ids, chain_ids, Zx, latent_block_ids, None, True, True)
+        edge_attr = self.edge_embedding(edge_type)
+        H = self.dec_latent2hidden(Zh)
+        block_h, _ = self.decoder(H, Zx, latent_block_ids, batch_ids, edges, edge_attr)
+        return block_h
+
+    def _load_fragment_smiles_from_file(self, path: Optional[str], limit: Optional[int] = None) -> List[str]:
+        if not path:
+            return []
+        normalized = os.path.abspath(path)
+        # Older checkpoints do not store these caches, so lazily create them the first time we need them.
+        if not hasattr(self, '_fragment_pool_cache') or self._fragment_pool_cache is None:
+            self._fragment_pool_cache = {}
+        cached = self._fragment_pool_cache.get(normalized, None)
+        if cached is None:
+            smiles_list: List[str] = []
+            try:
+                with open(normalized, 'r', encoding='utf-8') as handle:
+                    for line in handle:
+                        if not line.strip():
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except Exception:
+                            continue
+                        frag = rec.get('fragment_smiles') or rec.get('frag')
+                        if frag:
+                            smiles_list.append(frag)
+            except Exception:
+                smiles_list = []
+            self._fragment_pool_cache[normalized] = smiles_list
+            cached = smiles_list
+        if limit is not None and limit > 0:
+            return cached[:limit]
+        return cached
+
+    def _sample_fallback_negatives(self, key: str, exclude: set, k: int) -> List[str]:
+        """Sample up to k fallback fragments for the given modality, excluding provided SMILES."""
+        if k <= 0:
+            return []
+        pools: List[str] = []
+        # TODO: polish the logic here
+        fallback_defaults = {
+            'molecule': ['./datasets/molecule/CrossDocked/subgraphs.dynamic.sample5k.jsonl'],
+            'peptide': ['./datasets/peptide/subgraphs_residue.train.jsonl'],
+        }
+        for path in fallback_defaults.get(key, []):
+            pools.extend(self._load_fragment_smiles_from_file(path))
+        candidates = [s for s in pools if s and s not in exclude]
+        if not candidates:
+            return []
+        if len(candidates) <= k:
+            return candidates
+        return random.sample(candidates, k)
+
+    def _encode_fragment_candidates(self, smiles_list: List[Optional[str]], device: torch.device) -> torch.Tensor:
+        """Encode fragment SMILES using the 2D encoder with a small cache to avoid recomputation."""
+        encoder = getattr(self, 'subgraph_encoder', None)
+        if encoder is None or not smiles_list:
+            return torch.empty((0, self.hidden_size), device=device)
+        if not hasattr(self, '_fragment_emb_cache') or self._fragment_emb_cache is None:
+            self._fragment_emb_cache = {}
+        encoded: List[Optional[torch.Tensor]] = []
+        to_encode: List[str] = []
+        encode_indices: List[int] = []
+        for idx, smi in enumerate(smiles_list):
+            if not smi:
+                encoded.append(None)
+                continue
+            cached = self._fragment_emb_cache.get(smi)
+            if cached is not None:
+                encoded.append(cached)
+            else:
+                encoded.append(None)
+                to_encode.append(smi)
+                encode_indices.append(idx)
+        if to_encode:
+            encoder = encoder.to(device)
+            was_training = encoder.training
+            if was_training:
+                encoder.eval()
+            with torch.no_grad():
+                new_emb = encoder.encode_smiles_list(to_encode, device=device)
+            if was_training:
+                encoder.train()
+            new_emb = F.normalize(new_emb, dim=-1)
+            for idx, smi, emb in zip(encode_indices, to_encode, new_emb):
+                self._fragment_emb_cache[smi] = emb.detach().cpu()
+                encoded[idx] = emb
+        final: List[torch.Tensor] = []
+        for entry in encoded:
+            if entry is None:
+                final.append(torch.zeros(self.hidden_size, device=device))
+            else:
+                if entry.device != device:
+                    final.append(entry.to(device))
+                else:
+                    final.append(entry)
+        return torch.stack(final, dim=0) if final else torch.empty((0, self.hidden_size), device=device)
+
     @oom_decorator
     def forward(
             self,
@@ -379,7 +514,6 @@ class CondIterAutoEncoder(nn.Module):
         (3) assemble the different objectives (reconstruction, contrastive,
         retrieval).  Only the first part is shown here; the rest of the method
         follows the same structure with additional inline comments."""
-        #TODO: 简化device设定的逻辑
         dyn_block_lengths = kwargs.pop('dyn_block_lengths', None)
         dyn_block_types = kwargs.pop('dyn_block_types', None)
         dyn_generate_mask = kwargs.pop('dyn_generate_mask', None)
@@ -392,31 +526,24 @@ class CondIterAutoEncoder(nn.Module):
         if dyn_fragment_smiles is not None:
             dyn_fragment_smiles = list(dyn_fragment_smiles)
 
-        block_lengths_device, block_lengths_dtype = block_lengths.device, block_lengths.dtype
-        chain_ids_device, chain_ids_dtype = chain_ids.device, chain_ids.dtype
-        position_ids_device, position_ids_dtype = position_ids.device, position_ids.dtype
-        generate_mask_device = generate_mask.device
-        S_device, S_dtype = S.device, S.dtype
-        is_aa_device, is_aa_dtype = is_aa.device, is_aa.dtype
+        def _override_tensor(src, ref, *, dtype=None):
+            if src is None or not torch.is_tensor(src) or src.numel() == 0:
+                return ref
+            target_dtype = dtype if dtype is not None else ref.dtype
+            return src.to(device=ref.device, dtype=target_dtype)
 
         block_ids_override = None
         if dyn_block_ids is not None and dyn_block_ids.numel():
             block_ids_override = dyn_block_ids.to(device=X.device, dtype=torch.long)
 
         if dyn_block_lengths is not None and dyn_block_lengths.numel():
-            block_lengths = dyn_block_lengths.to(device=block_lengths_device, dtype=block_lengths_dtype)
-            if dyn_block_types is not None and dyn_block_types.numel():
-                S = dyn_block_types.to(device=S_device, dtype=S_dtype)
-            if dyn_generate_mask is not None and dyn_generate_mask.numel():
-                generate_mask = dyn_generate_mask.to(device=generate_mask_device)
-            if dyn_chain_ids is not None and dyn_chain_ids.numel():
-                chain_ids = dyn_chain_ids.to(device=chain_ids_device, dtype=chain_ids_dtype)
-            if dyn_position_ids is not None and dyn_position_ids.numel():
-                position_ids = dyn_position_ids.to(device=position_ids_device, dtype=position_ids_dtype)
-            if dyn_is_aa is not None and dyn_is_aa.numel():
-                is_aa = dyn_is_aa.to(device=is_aa_device, dtype=is_aa_dtype)
-            if dyn_num_blocks is not None and dyn_num_blocks.numel():
-                lengths = dyn_num_blocks.to(device=lengths.device, dtype=lengths.dtype)
+            block_lengths = _override_tensor(dyn_block_lengths, block_lengths)
+            S = _override_tensor(dyn_block_types, S)
+            generate_mask = _override_tensor(dyn_generate_mask, generate_mask)
+            chain_ids = _override_tensor(dyn_chain_ids, chain_ids)
+            position_ids = _override_tensor(dyn_position_ids, position_ids)
+            is_aa = _override_tensor(dyn_is_aa, is_aa)
+            lengths = _override_tensor(dyn_num_blocks, lengths)
 
         # backup ground truth
         X_gt, S_gt, A_gt = X.clone(), S.clone(), A.clone()
@@ -563,7 +690,7 @@ class CondIterAutoEncoder(nn.Module):
                 dtype=torch.float
             )
         }
-        # TODO: Do we really need normalization? Yes
+
         block_hidden_norm = F.normalize(block_hidden, dim=-1)
         residue_mask = (~generate_mask) & (is_aa if 'is_aa' in locals() else torch.zeros_like(generate_mask))
         if residue_mask.device != block_hidden_norm.device:
@@ -781,11 +908,10 @@ class CondIterAutoEncoder(nn.Module):
                                 neg_tensors.append(cand)
                                 total_added += cand.shape[0]
                                 exclude_set.update(same_smiles)
-                                # same_index_obj corresponds to in‑modal JSONL: rag_index=molecule, rag_cross_index=peptide
-                                if same_index_obj is getattr(self, 'rag_index', None):
-                                    neg_ext_molecule.extend([s for s in (same_smiles or []) if s])
-                                elif same_index_obj is getattr(self, 'rag_cross_index', None):
-                                    neg_ext_peptide.extend([s for s in (same_smiles or []) if s])
+                            if same_index_obj is getattr(self, 'rag_index', None):
+                                neg_ext_molecule.extend([s for s in (same_smiles or []) if s])
+                            elif same_index_obj is getattr(self, 'rag_cross_index', None):
+                                neg_ext_peptide.extend([s for s in (same_smiles or []) if s])
 
                     if cross_target > 0:
                         cross_smiles = _draw_from_index(cross_index_obj, cross_target, exclude_set)
@@ -794,7 +920,6 @@ class CondIterAutoEncoder(nn.Module):
                             neg_tensors.append(cand)
                             total_added += cand.shape[0]
                             exclude_set.update(cross_smiles)
-                            # cross_index_obj corresponds to cross‑modal JSONL: rag_index=molecule, rag_cross_index=peptide
                             if cross_index_obj is getattr(self, 'rag_index', None):
                                 neg_ext_molecule.extend([s for s in (cross_smiles or []) if s])
                             elif cross_index_obj is getattr(self, 'rag_cross_index', None):
@@ -823,7 +948,6 @@ class CondIterAutoEncoder(nn.Module):
                 )
                 if neg_emb.numel():
                     neg_chunks.append(torch.matmul(anchors, neg_emb.t()))
-                    # best effort: sampled negatives here come from retrieval/index; treat as molecule if in retrieval_index, otherwise JSONL may be molecule index
                     if neg_smiles:
                         neg_ext_molecule.extend([s for s in neg_smiles if s])
 
@@ -843,7 +967,6 @@ class CondIterAutoEncoder(nn.Module):
             neg_logits = torch.cat(neg_chunks, dim=1)
             logits = torch.cat([pos_logits, neg_logits], dim=1) / max(temperature, 1e-6)
             labels = torch.zeros(m, dtype=torch.long, device=anchors.device)
-            # per‑row losses for later per‑sample logging
             per_row_loss = F.cross_entropy(logits, labels, reduction='none')
             loss = per_row_loss.mean()
             info = {
@@ -861,6 +984,7 @@ class CondIterAutoEncoder(nn.Module):
         rag_source_count = 0
         if self.rag_enabled:
             rag_source_smiles = kwargs.get('rag_source_smiles', None)
+            rag_source_list = []
             if isinstance(rag_source_smiles, (list, tuple)):
                 rag_source_count = sum(1 for item in rag_source_smiles if item)
                 rag_source_list = list(rag_source_smiles)
@@ -874,7 +998,6 @@ class CondIterAutoEncoder(nn.Module):
             # Only treat dyn_fragment_smiles as valid when dynamic blocks are active
             dyn_mode_active = (dyn_block_lengths is not None and isinstance(dyn_block_lengths, torch.Tensor) and dyn_block_lengths.numel() > 0)
             dyn_frags_valid = bool(dyn_mode_active and dyn_fragment_smiles is not None and any(bool(s) for s in dyn_fragment_smiles))
-            rag_loss_applied = False
             rag_anchor_count = 0
             rag_negative_count = 0
             rag_dyn_pos_candidates = 0
@@ -894,6 +1017,36 @@ class CondIterAutoEncoder(nn.Module):
                     sample_idx = batch_id_list[block_idx]
                     if smi:
                         dyn_fragments_per_sample.setdefault(sample_idx, []).append(smi)
+            partition_records: list[Optional[dict[str, list]]] = [None] * batch_size
+            try:
+                lengths_list = lengths.detach().cpu().tolist()
+                block_lengths_list = block_lengths.detach().cpu().tolist()
+                block_types_list = S.detach().cpu().tolist()
+                block_generate_mask_list = generate_mask.detach().cpu().tolist()
+                chain_ids_list = chain_ids.detach().cpu().tolist()
+                position_ids_list = position_ids.detach().cpu().tolist()
+                is_aa_list = is_aa.detach().cpu().tolist()
+                fragments_linear = list(dyn_fragment_smiles) if isinstance(dyn_fragment_smiles, list) else []
+                offset = 0
+                for sample_idx, num_blocks in enumerate(lengths_list):
+                    end = offset + int(num_blocks)
+                    frag_slice = fragments_linear[offset:end] if end <= len(fragments_linear) else fragments_linear[offset:len(fragments_linear)]
+                    record = {
+                        'block_lengths': block_lengths_list[offset:end],
+                        'block_types': block_types_list[offset:end],
+                        'generate_mask': block_generate_mask_list[offset:end],
+                        'chain_ids': chain_ids_list[offset:end],
+                        'position_ids': position_ids_list[offset:end],
+                        'is_aa': is_aa_list[offset:end],
+                        'fragment_smiles': frag_slice,
+                        'ligand_fragments': dyn_fragments_per_sample.get(sample_idx, []),
+                    }
+                    if sample_idx < len(rag_source_list):
+                        record['rag_source_smiles'] = rag_source_list[sample_idx]
+                    partition_records[sample_idx] = record
+                    offset = end
+            except Exception:
+                partition_records = [None] * batch_size
             try:
                 # per-block anchors with dynamically generated fragments
                 if dyn_frags_valid:
@@ -967,8 +1120,6 @@ class CondIterAutoEncoder(nn.Module):
                                 exclude_smiles=pos_smiles,
                                 source_types=source_flags
                             )
-                            if loss_val<1e-4:
-                                breakpoint()
                         else:
                             if self.rag_debug:
                                 from utils.logger import print_log
@@ -1063,7 +1214,7 @@ class CondIterAutoEncoder(nn.Module):
                                                 inb_mol.append(smi)
                                             else:
                                                 inb_pep.append(smi)
-                                        in_batch_lists.append((si, inb_mol[:10], inb_pep[:10]))
+                                        in_batch_lists.append((si, i_local, inb_mol[:10], inb_pep[:10]))
                                 except Exception:
                                     in_batch_lists = []
                                 # merge into rag_negatives_map per sample
@@ -1071,6 +1222,7 @@ class CondIterAutoEncoder(nn.Module):
                                     rec = rag_negatives_map.get(si, {})
                                     rec.setdefault('external', {})
                                     rec.setdefault('in_batch', {})
+                                    rec.setdefault('per_fragment', [])
                                     if ext_mol:
                                         prev = rec['external'].get('molecule', [])
                                         rec['external']['molecule'] = (prev + ext_mol)[:20]
@@ -1078,17 +1230,47 @@ class CondIterAutoEncoder(nn.Module):
                                         prev = rec['external'].get('peptide', [])
                                         rec['external']['peptide'] = (prev + ext_pep)[:20]
                                     rag_negatives_map[si] = rec
-                                for si, inb_mol, inb_pep in in_batch_lists:
+                                per_fragment_inbatch = {}
+                                for si, i_local, inb_mol, inb_pep in in_batch_lists:
                                     rec = rag_negatives_map.get(si, {})
                                     rec.setdefault('external', {})
                                     rec.setdefault('in_batch', {})
+                                    rec.setdefault('per_fragment', [])
                                     if inb_mol:
                                         prev = rec['in_batch'].get('molecule', [])
                                         rec['in_batch']['molecule'] = (prev + inb_mol)[:20]
                                     if inb_pep:
                                         prev = rec['in_batch'].get('peptide', [])
                                         rec['in_batch']['peptide'] = (prev + inb_pep)[:20]
+                                    per_fragment_inbatch[(si, i_local)] = {
+                                        'molecule': list(inb_mol[:10]),
+                                        'peptide': list(inb_pep[:10]),
+                                    }
                                     rag_negatives_map[si] = rec
+                                ext_mol_unique = list({s for s in ext_mol})[:10]
+                                ext_pep_unique = list({s for s in ext_pep})[:10]
+                                for i_local, (si, frag_smi) in enumerate(zip(sample_indices, pos_smiles[:len(sample_indices)])):
+                                    if not frag_smi or si < 0 or si >= batch_size:
+                                        continue
+                                    rec = rag_negatives_map.get(si, {})
+                                    rec.setdefault('external', {})
+                                    rec.setdefault('in_batch', {})
+                                    rec.setdefault('per_fragment', [])
+                                    frag_inbatch = per_fragment_inbatch.get((si, i_local), {'molecule': [], 'peptide': []})
+                                    frag_entry = {
+                                        'fragment_smiles': frag_smi,
+                                        'external': {
+                                            'molecule': ext_mol_unique,
+                                            'peptide': ext_pep_unique,
+                                        },
+                                        'in_batch': {
+                                            'molecule': list(frag_inbatch.get('molecule', [])),
+                                            'peptide': list(frag_inbatch.get('peptide', [])),
+                                        },
+                                    }
+                                    rec['per_fragment'].append(frag_entry)
+                                    rag_negatives_map[si] = rec
+
             except Exception as exc:
                 # Keep training even if RAG computation fails; leave rag loss as 0
                 rag_debug_error = 1
@@ -1184,6 +1366,8 @@ class CondIterAutoEncoder(nn.Module):
                     'outcome': 'failure',
                     'success': False,
                 }
+                if idx < len(partition_records) and partition_records[idx] is not None:
+                    record['partition'] = partition_records[idx]
                 if skip_entry and skip_entry.get('exclude_smiles'):
                     record['exclude_smiles'] = skip_entry['exclude_smiles']
                 if current_epoch is not None:
@@ -1246,6 +1430,8 @@ class CondIterAutoEncoder(nn.Module):
                     record['reason'].extend(sorted(skip_entry.get('reasons', [])))
                     if skip_entry.get('exclude_smiles'):
                         record['exclude_smiles'] = skip_entry['exclude_smiles']
+                if idx < len(partition_records) and partition_records[idx] is not None:
+                    record['partition'] = partition_records[idx]
                 record['reason'] = sorted({r for r in record['reason'] if r})
                 record['failure_reasons'] = []
                 log_every = getattr(self, 'rag_success_log_every', 1)
@@ -1377,12 +1563,7 @@ class CondIterAutoEncoder(nn.Module):
                 pred_block_logits: [Nblock, n_block_type]
                 block_h (optional): [Nblock, hidden_size]
         '''
-        batch_ids = length_to_batch_id(lengths)
-        latent_block_ids = torch.ones_like(batch_ids).cumsum(dim=-1) - 1
-        edges, edge_type = self.get_edges(batch_ids, chain_ids, Zx, latent_block_ids, None, True, True)
-        edge_attr = self.edge_embedding(edge_type)
-        H = self.dec_latent2hidden(Zh)
-        block_h, _ = self.decoder(H, Zx, latent_block_ids, batch_ids, edges, edge_attr)
+        block_h = self._decode_block_hidden(Zh, Zx, chain_ids, lengths)
         pred_block_logits = self.block_type_mlp(block_h)
         if return_hidden:
             return pred_block_logits, block_h
@@ -1861,6 +2042,8 @@ class CondIterAutoEncoder(nn.Module):
         dyn_is_aa = kwargs.pop('dyn_is_aa', None)
         dyn_num_blocks = kwargs.pop('dyn_num_blocks', None)
         dyn_fragment_smiles = kwargs.pop('dyn_fragment_smiles', None)
+        if dyn_fragment_smiles is not None:
+            dyn_fragment_smiles = list(dyn_fragment_smiles)
 
         block_lengths_device, block_lengths_dtype = block_lengths.device, block_lengths.dtype
         chain_ids_device, chain_ids_dtype = chain_ids.device, chain_ids.dtype
@@ -1908,23 +2091,83 @@ class CondIterAutoEncoder(nn.Module):
             for idx, smi in enumerate(dyn_fragment_smiles):
                 if idx < total_blocks:
                     fragment_smiles_list[idx] = smi
+        gt_fragment_smiles_list: List[Optional[str]] = list(fragment_smiles_list)
 
         # start_t = 0.5
+        retrieval_records = []
+        pred_block_type = S.clone()
+        # default stats for downstream logging even when no retrieval attempted
+        self.last_retrieval_stats = {
+            'evaluated_blocks': 0,
+            'correct_selections': 0,
+            'accuracy': 0.0
+        }
         if not fixseq:
-            # decode block types from latent graph
-            pred_block_logits, block_hidden = self.decode_block_type(Zh, Zx, chain_ids, lengths, return_hidden=True)
-            # mask non aa positions if is_aa == True
-            non_aa_mask = ~torch.tensor(VOCAB.aa_mask, dtype=torch.bool, device=is_aa.device)
-            pred_block_logits = pred_block_logits.masked_fill(non_aa_mask[None, :] & is_aa[:, None], float('-inf'))
-            pred_block_prob = torch.softmax(pred_block_logits, dim=-1) # [Nblock, num_block_type]
-            prob, pred_block_type = torch.max(pred_block_prob, dim=-1) # [Nblock]
-            pred_block_type[~topo_generate_mask] = S[~topo_generate_mask]
-
+            block_hidden = self._decode_block_hidden(Zh, Zx, chain_ids, lengths)
+            block_hidden_norm = F.normalize(block_hidden, dim=-1)
+            if not hasattr(self, 'fragment_fallback_paths') or self.fragment_fallback_paths is None:
+                self.fragment_fallback_paths = {'molecule': [], 'peptide': []}
+            if not hasattr(self, 'generate_negatives_per_block'):
+                self.generate_negatives_per_block = 8
+            if not hasattr(self, '_fragment_emb_cache') or self._fragment_emb_cache is None:
+                self._fragment_emb_cache = {}
+            if not hasattr(self, 'hidden_size'):
+                if hasattr(self, 'dec_latent2hidden'):
+                    self.hidden_size = self.dec_latent2hidden.out_features
+                elif hasattr(self, 'enc_embed2hidden'):
+                    self.hidden_size = self.enc_embed2hidden.out_features
+                else:
+                    raise AttributeError("Hidden size unavailable; checkpoint incompatible with retrieval evaluation.")
             gen_block_indices = torch.nonzero(generate_mask, as_tuple=False).view(-1)
-
-            # initialize (append atoms and sample coordinates)
+            for idx_tensor in gen_block_indices:
+                block_idx = int(idx_tensor.item())
+                if not topo_generate_mask[block_idx]:
+                    continue
+                pool_key = 'peptide' if bool(is_aa[block_idx]) else 'molecule'
+                positive = fragment_smiles_list[block_idx]
+                candidate_smiles: List[Optional[str]] = []
+                exclude: set = set()
+                if positive:
+                    candidate_smiles.append(positive)
+                    exclude.add(positive)
+                in_batch_negatives: List[str] = []
+                if fragment_smiles_list:
+                    for j, smi in enumerate(fragment_smiles_list):
+                        if j == block_idx or not smi:
+                            continue
+                        if bool(is_aa[j]) == bool(is_aa[block_idx]) and smi not in exclude:
+                            in_batch_negatives.append(smi)
+                random.shuffle(in_batch_negatives)
+                required_negative = getattr(self, 'generate_negatives_per_block', 8)
+                negatives: List[str] = []
+                for smi in in_batch_negatives:
+                    negatives.append(smi)
+                    exclude.add(smi)
+                    if len(negatives) >= required_negative:
+                        break
+                if len(negatives) < required_negative:
+                    fallback_needed = required_negative - len(negatives)
+                    fallback_samples = self._sample_fallback_negatives(pool_key, exclude, fallback_needed)
+                    negatives.extend(fallback_samples)
+                    exclude.update(fallback_samples)
+                candidate_smiles.extend(negatives)
+                embeddings = self._encode_fragment_candidates(candidate_smiles, block_hidden_norm.device)
+                if embeddings.shape[0] == 0:
+                    chosen_smiles = positive
+                else:
+                    query = block_hidden_norm[block_idx:block_idx + 1]
+                    sims = torch.matmul(query, embeddings.t()).squeeze(0)
+                    best_idx = int(torch.argmax(sims).item())
+                    chosen_smiles = candidate_smiles[best_idx] if candidate_smiles else positive
+                    retrieval_records.append({
+                        'block_index': block_idx,
+                        'has_positive': bool(positive),
+                        'selected_positive': bool(positive) and (chosen_smiles == positive),
+                        'num_candidates': len(candidate_smiles)
+                    })
+                fragment_smiles_list[block_idx] = chosen_smiles
             X_t, A, block_ids, bonds = self._init_atoms(
-                pred_block_type, X, A, bonds, Zx, block_ids, generate_mask,
+                S, X, A, bonds, Zx, block_ids, generate_mask,
                 fragment_smiles=fragment_smiles_list, topo_generate_mask=topo_generate_mask
             )
         else:
@@ -2005,6 +2248,8 @@ class CondIterAutoEncoder(nn.Module):
 
         # get results
         batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds = [], [], [], [], [], []
+        batch_fragment_smiles: List[List[Optional[str]]] = []
+        batch_gt_fragment_smiles: List[List[Optional[str]]] = []
         batch_ids = length_to_batch_id(lengths)
         for i, l in enumerate(lengths):
             batch_X.append([])
@@ -2022,6 +2267,9 @@ class CondIterAutoEncoder(nn.Module):
                 batch_ll[-1].append(cur_atom_ll[cur_block_ids == j].tolist())
 
             batch_S.append(pred_block_type[generate_mask & (batch_ids == i)].tolist())
+            gen_block_indices = torch.nonzero(generate_mask & (batch_ids == i), as_tuple=False).view(-1).tolist()
+            batch_fragment_smiles.append([fragment_smiles_list[idx] for idx in gen_block_indices])
+            batch_gt_fragment_smiles.append([gt_fragment_smiles_list[idx] for idx in gen_block_indices])
 
             # get bonds (inter-block)
             global2local = -torch.ones_like(cur_mask, dtype=torch.long) # set non-related to -1 for later check
@@ -2040,4 +2288,22 @@ class CondIterAutoEncoder(nn.Module):
                 local_col = intra_col[bond_mask] - block_offsets[block_ids[intra_col[bond_mask]]]
                 batch_intra_bonds[-1].append((local_row.tolist(), local_col.tolist(), intra_bond_type[bond_mask].tolist()))
 
+        if retrieval_records:
+            hits = sum(1 for rec in retrieval_records if rec['has_positive'])
+            correct = sum(1 for rec in retrieval_records if rec['selected_positive'])
+            self.last_retrieval_stats = {
+                'evaluated_blocks': hits,
+                'correct_selections': correct,
+                'accuracy': float(correct) / hits if hits else 0.0
+            }
+        self.last_fragment_smiles = [
+            {
+                'retrieved': fragments,
+                'ground_truth': gt_fragments
+            }
+            for fragments, gt_fragments in zip(batch_fragment_smiles, batch_gt_fragment_smiles)
+        ]
+
+        # NOTE: batch_S 继续输出 `pred_block_type` 仅为保持 downstream 写结果的接口一致；
+        # 实际检索的 SMILES 选择已通过 fragment_smiles_list 和 retrieval_stats 体现。
         return batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds # inter-block bonds and intra-block bonds

@@ -96,7 +96,7 @@ def generate_wrapper(model, sample_opt=None):
     return wrapper
 
 
-def overwrite(cplx: Complex, summary: Summary, S: list, X: list, A: list, ll: list, bonds: tuple, intra_bonds: list, out_path: str, check_validity: bool=True, expect_atom_num=None):
+def overwrite(cplx: Complex, summary: Summary, S: list, X: list, A: list, ll: list, bonds: tuple, intra_bonds: list, out_path: str, check_validity: bool=True, expect_atom_num=None, fragment_smiles=None, ground_truth_fragments=None):
     '''
         Args:
             bonds: [row, col, prob, type], row and col are atom index, prob has confidence and distance
@@ -114,7 +114,8 @@ def overwrite(cplx: Complex, summary: Summary, S: list, X: list, A: list, ll: li
         ll = ll,
         inter_bonds = bonds,
         intra_bonds = intra_bonds,
-        out_path = out_path
+        out_path = out_path,
+        fragment_smiles = fragment_smiles
     )
 
     cplx, gen_mol, overwrite_indexes = task.get_overwritten_results(
@@ -125,17 +126,33 @@ def overwrite(cplx: Complex, summary: Summary, S: list, X: list, A: list, ll: li
     if cplx is None or gen_mol is None:
         return None
 
-    return {
+    retrieved_fragments = task.get_generated_seq()
+    if isinstance(fragment_smiles, (list, tuple)):
+        retrieved_fragments = list(fragment_smiles)
+    elif isinstance(retrieved_fragments, tuple):
+        retrieved_fragments = list(retrieved_fragments)
+    elif isinstance(retrieved_fragments, list):
+        retrieved_fragments = list(retrieved_fragments)
+    result = {
         'id': summary.id,
         'pmetric': task.get_total_likelihood(),
         'smiles': Chem.MolToSmiles(gen_mol),
-        'gen_seq': task.get_generated_seq(),
+        'gen_seq': retrieved_fragments,
+        'fragment_smiles': retrieved_fragments,
         'target_chains_ids': summary.target_chain_ids,
         'ligand_chains_ids': summary.ligand_chain_ids,
         'gen_block_idx': overwrite_indexes, # TODO: in pdb, (1, '0') will be saved as (1, 'A')
         'gen_pdb': os.path.abspath(out_path),
         'ref_pdb': os.path.abspath(summary.ref_pdb),
     }
+    if ground_truth_fragments is not None:
+        gt_list = list(ground_truth_fragments)
+        result['ground_truth_fragment_smiles'] = gt_list
+        result['gen_seq'] = gt_list
+    else:
+        result['ground_truth_fragment_smiles'] = None
+    result['ground_truth_smiles'] = getattr(summary, 'ref_seq', None)
+    return result
 
 
 def format_id(summary: Summary):
@@ -182,6 +199,9 @@ def main(args, opt_args):
     
     batch_size = config['dataloader']['batch_size']
 
+    total_blocks = 0
+    total_hits = 0
+
     while not recorder.is_finished():
         batch_list = recorder.get_next_batch_list(batch_size)
         batch = [test_set[i] for i, _ in batch_list]
@@ -190,9 +210,25 @@ def main(args, opt_args):
         
         with torch.no_grad():
             batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds = generate_wrapper(model, deepcopy(config.get('sample_opt', {})))(batch)
+        fragment_payload = getattr(model, 'last_fragment_smiles', None)
 
         vae_batch_list = []
-        for S, X, A, ll, bonds, intra_bonds, (item_idx, n) in zip(batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds, batch_list):
+        for sample_idx, (S, X, A, ll, bonds, intra_bonds, (item_idx, n)) in enumerate(zip(batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds, batch_list)):
+            fragment_smiles = None
+            ground_truth_fragments = None
+            if isinstance(fragment_payload, list) and sample_idx < len(fragment_payload):
+                payload_entry = fragment_payload[sample_idx]
+                if isinstance(payload_entry, dict):
+                    fragment_smiles = payload_entry.get('retrieved')
+                    ground_truth_fragments = payload_entry.get('ground_truth')
+                else:
+                    fragment_smiles = payload_entry
+            if isinstance(fragment_smiles, (list, tuple)):
+                fragment_smiles = list(fragment_smiles)
+            if isinstance(ground_truth_fragments, tuple):
+                ground_truth_fragments = list(ground_truth_fragments)
+            elif isinstance(ground_truth_fragments, list):
+                ground_truth_fragments = list(ground_truth_fragments)
             cplx: Complex = deepcopy(test_set.get_raw_data(item_idx))
             summary: Summary = deepcopy(test_set.get_summary(item_idx))
             # revise id
@@ -206,7 +242,25 @@ def main(args, opt_args):
                 complex_to_pdb(cplx, os.path.join(tmp_cand_save_dir, summary.id, 'pocket.pdb'), summary.target_chain_ids)
             if n_cycles == 0: save_path = os.path.join(cand_save_dir, summary.id, f'{n}.pdb')
             else: save_path = os.path.join(tmp_cand_save_dir, summary.id, f'{n}.pdb')
-            log = overwrite(cplx, summary, S, X, A, ll, bonds, intra_bonds, save_path, check_validity=False)
+            log = overwrite(
+                cplx, summary, S, X, A, ll, bonds, intra_bonds, save_path,
+                check_validity=False, fragment_smiles=fragment_smiles, ground_truth_fragments=ground_truth_fragments
+            )
+            stats = getattr(model, 'last_retrieval_stats', None)
+            if stats:
+                total_blocks += stats.get('evaluated_blocks', 0)
+                total_hits += stats.get('correct_selections', 0)
+                if log is not None:
+                    log.setdefault('retrieval_stats', {
+                        'evaluated_blocks': 0,
+                        'correct_selections': 0,
+                        'accuracy': 0.0
+                    })
+                    log['retrieval_stats'] = {
+                        'evaluated_blocks': stats.get('evaluated_blocks', 0),
+                        'correct_selections': stats.get('correct_selections', 0),
+                        'accuracy': stats.get('accuracy', 0.0)
+                    }
             if n_cycles == 0: recorder.check_and_save(log, item_idx, n, struct_only)
             else:
                 vae_batch_list.append(
@@ -227,7 +281,23 @@ def main(args, opt_args):
             with torch.no_grad():
                 if final_cycle: batch['topo_generate_mask'] = torch.zeros_like(batch['generate_mask'])
                 batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds = generate_wrapper(model_autoencoder, deepcopy(config.get('sample_opt', {})))(batch)
-            for S, X, A, ll, bonds, intra_bonds, (item_idx, n) in zip(batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds, batch_list):
+            fragment_payload = getattr(model_autoencoder, 'last_fragment_smiles', None)
+            for sample_idx, (S, X, A, ll, bonds, intra_bonds, (item_idx, n)) in enumerate(zip(batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds, batch_list)):
+                fragment_smiles = None
+                ground_truth_fragments = None
+                if isinstance(fragment_payload, list) and sample_idx < len(fragment_payload):
+                    payload_entry = fragment_payload[sample_idx]
+                    if isinstance(payload_entry, dict):
+                        fragment_smiles = payload_entry.get('retrieved')
+                        ground_truth_fragments = payload_entry.get('ground_truth')
+                    else:
+                        fragment_smiles = payload_entry
+                if isinstance(fragment_smiles, (list, tuple)):
+                    fragment_smiles = list(fragment_smiles)
+                if isinstance(ground_truth_fragments, tuple):
+                    ground_truth_fragments = list(ground_truth_fragments)
+                elif isinstance(ground_truth_fragments, list):
+                    ground_truth_fragments = list(ground_truth_fragments)
                 cplx: Complex = deepcopy(test_set.get_raw_data(item_idx))
                 summary: Summary = deepcopy(test_set.get_summary(item_idx))
                 # revise id
@@ -239,7 +309,26 @@ def main(args, opt_args):
                 if hasattr(test_set, 'get_expected_atom_num'):
                     expect_atom_num = test_set.get_expected_atom_num(item_idx)
                 else: expect_atom_num = None
-                log = overwrite(cplx, summary, S, X, A, ll, bonds, intra_bonds, save_path, check_validity=final_cycle, expect_atom_num=expect_atom_num)
+                log = overwrite(
+                    cplx, summary, S, X, A, ll, bonds, intra_bonds, save_path,
+                    check_validity=final_cycle, expect_atom_num=expect_atom_num,
+                    fragment_smiles=fragment_smiles, ground_truth_fragments=ground_truth_fragments
+                )
+                stats = getattr(model_autoencoder, 'last_retrieval_stats', None)
+                if stats:
+                    total_blocks += stats.get('evaluated_blocks', 0)
+                    total_hits += stats.get('correct_selections', 0)
+                    if log is not None:
+                        log.setdefault('retrieval_stats', {
+                            'evaluated_blocks': 0,
+                            'correct_selections': 0,
+                            'accuracy': 0.0
+                        })
+                        log['retrieval_stats'] = {
+                            'evaluated_blocks': stats.get('evaluated_blocks', 0),
+                            'correct_selections': stats.get('correct_selections', 0),
+                            'accuracy': stats.get('accuracy', 0.0)
+                        }
                 if final_cycle: recorder.check_and_save(log, item_idx, n, struct_only)
                 else:
                     vae_batch_list.append(
@@ -251,6 +340,9 @@ def main(args, opt_args):
                     )
 
         print_log(f'Failed rate: {recorder.num_failed / recorder.num_generated}', level='DEBUG')
+    if total_blocks:
+        accuracy = total_hits / total_blocks if total_blocks else 0.0
+        print_log(f'Retrieval stats - total blocks: {total_blocks}, correct: {total_hits}, accuracy: {accuracy:.4f}', level='INFO')
     return    
 
 
