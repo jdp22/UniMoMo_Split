@@ -1,0 +1,54 @@
+# dataset:
+#   test:
+#     class: DynamicBatchWrapper
+#     dataset:
+#       class: DynamicBlockWrapper
+#       dataset:
+#         class: MoleculeDataset
+#         mmap_dir: ./datasets/molecule/CrossDocked/processed
+#         specify_index: ./datasets/molecule/CrossDocked/processed/test_index.txt
+#         length_type: atom
+#       num_parts: [2, 3, 4]
+#       seed: 7801
+#       max_attempts: 5
+#       storage_path: ./datasets/molecule/CrossDocked/subgraphs.dynamic.jsonl
+#       min_heavy_atoms: [8, 6, 4]
+#       storage_min_heavy_atoms: 8
+#     complexity: n*n
+#     ubound_per_batch: 120000
+#     n_use_max_in_batch: true
+
+dataset:
+  test:
+    class: DynamicBatchWrapper
+    dataset:
+      class: RAGBatchWrapper
+      dataset:
+        class: DynamicBlockWrapper
+        dataset:
+          class: MoleculeDataset
+          mmap_dir: ./datasets/molecule/CrossDocked/processed
+          specify_index: ./datasets/molecule/CrossDocked/processed/test_index.txt
+          length_type: atom
+        num_parts: [2, 3, 4]
+        seed: 7801
+        max_attempts: 5
+        storage_path: ./datasets/molecule/CrossDocked/subgraphs.dynamic.jsonl
+        min_heavy_atoms: [8, 6, 4]
+        min_fragment_atoms: 4
+        invalid_log_path: ./logs/invalid_dynamic_fragments.test.jsonl
+        storage_min_heavy_atoms: 8
+    complexity: n*n
+    ubound_per_batch: 120000
+    n_use_max_in_batch: true
+
+
+dataloader:
+  num_workers: 4
+  batch_size: 1
+
+n_samples: 100
+n_cycles: 0
+
+sample_opt:
+  mode: codesign          # enable fragment retrieval + structure generation

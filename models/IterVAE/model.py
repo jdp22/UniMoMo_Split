@@ -3,9 +3,11 @@
 import json
 import os
 import random
+from collections import deque
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from typing import Optional, List
 from rdkit import Chem
 
@@ -252,9 +254,16 @@ class CondIterAutoEncoder(nn.Module):
         self.rag_zero_log_path = None
         self.rag_zero_detail_log_path = None
         self.rag_success_detail_log_path = None
+        self.rag_batch_diag_log_path = None
+        self.rag_fragment_freq_log_path = None
+        self.rag_fragment_freq_log_every = 1
         self.rag_cross_index = None
         self.rag_cross_modal_neg_ratio = 0.0
         self.rag_strict_dynamic_pos = False
+        self.rag_use_full_inbatch_negatives = False
+        self.rag_share_inbatch_negatives = False
+        self._rag_fragment_totals = {'molecule': {}, 'peptide': {}}
+        self._rag_fragment_freq_counter = 0
         if rag_opt is not None and isinstance(rag_opt, dict):
             # Configure the optional 2D fragment encoder and negative sampling indexes.
             # The try/except ensures training keeps running even if RDKit/subgraph
@@ -282,9 +291,17 @@ class CondIterAutoEncoder(nn.Module):
                 self.rag_use_mean_pool = rag_opt.get('use_mean_pool', True)
                 self.rag_debug = rag_opt.get('debug', False)
                 self.rag_enabled = True
+                self.rag_use_full_inbatch_negatives = bool(rag_opt.get('use_full_inbatch_negatives', False))
+                self.rag_share_inbatch_negatives = bool(rag_opt.get('share_inbatch_negatives', False))
                 self.rag_zero_log_path = rag_opt.get('zero_positive_log', None)
                 self.rag_zero_detail_log_path = rag_opt.get('zero_detail_log', None)
                 self.rag_success_detail_log_path = rag_opt.get('success_detail_log', None)
+                self.rag_batch_diag_log_path = rag_opt.get('batch_diagnostics_log', None)
+                self.rag_fragment_freq_log_path = rag_opt.get('fragment_frequency_log', None)
+                try:
+                    self.rag_fragment_freq_log_every = int(rag_opt.get('fragment_freq_log_every', 1) or 1)
+                except Exception:
+                    self.rag_fragment_freq_log_every = 1
                 self.rag_cross_modal_neg_ratio = float(rag_opt.get('cross_modal_neg_ratio', 0.0) or 0.0)
                 self.rag_strict_dynamic_pos = bool(rag_opt.get('strict_dynamic_pos', False))
                 cross_index_path = rag_opt.get('cross_modal_index')
@@ -341,6 +358,19 @@ class CondIterAutoEncoder(nn.Module):
         self._fragment_pool_cache: dict[str, List[str]] = {}
         self.generate_negatives_per_block = 8
         self._fragment_emb_cache: dict[str, torch.Tensor] = {}
+        self.rag_fragment_buffer_size = 0
+        self.rag_fragment_buffer = None
+        if isinstance(rag_opt, dict):
+            try:
+                buffer_size = int(rag_opt.get('fragment_buffer_size', 20000) or 0)
+            except Exception:
+                buffer_size = 0
+            if buffer_size > 0:
+                self.rag_fragment_buffer_size = buffer_size
+                self.rag_fragment_buffer = {
+                    'molecule': deque(maxlen=buffer_size),
+                    'peptide': deque(maxlen=buffer_size)
+                }
 
         # --- Dynamic fragment retrieval index (separate from RAG) ---
         self.retrieval_enabled = False
@@ -355,6 +385,7 @@ class CondIterAutoEncoder(nn.Module):
         self.contrastive_temperature = float(contrastive_opt.get('temperature', 0.07))
         self.contrastive_queue_size = int(contrastive_opt.get('queue_size', 256))
         self.use_contrastive_queue = self.contrastive_queue_size > 0
+        # queues buffer historical representations for pocket (x) and ligand (y) sides.
         self.register_buffer('contrastive_queue_x', torch.empty(0, hidden_size))
         self.register_buffer('contrastive_queue_y', torch.empty(0, hidden_size))
 
@@ -367,6 +398,80 @@ class CondIterAutoEncoder(nn.Module):
     @property
     def latent_size(self):
         return self.mask_embedding.shape[0]
+
+    def _aggregate_fragment_freq_totals(self, local_payload: Optional[dict]):
+        """
+        Gather fragment frequency dictionaries from all ranks (if distributed)
+        and return the merged totals along with a flag indicating whether this
+        rank is responsible for writing logs (rank 0 in distributed mode).
+        """
+        distributed = dist.is_available() and dist.is_initialized()
+        payload = local_payload or {}
+        if not distributed:
+            cleaned = {k: v for k, v in payload.items() if v}
+            return cleaned, True
+        world_size = dist.get_world_size()
+        gathered: list[Optional[dict]] = [None for _ in range(world_size)]
+        try:
+            dist.all_gather_object(gathered, payload)
+        except RuntimeError:
+            # Fallback: if gather fails, just use local payload on this rank.
+            cleaned = {k: v for k, v in payload.items() if v}
+            return cleaned, dist.get_rank() == 0
+        combined = {'molecule': {}, 'peptide': {}}
+        for item in gathered:
+            if not isinstance(item, dict):
+                continue
+            for src, freq_map in item.items():
+                if not freq_map:
+                    continue
+                bucket = combined.setdefault(src, {})
+                for frag, count in freq_map.items():
+                    if frag is None:
+                        continue
+                    try:
+                        bucket[frag] = bucket.get(frag, 0) + int(count)
+                    except Exception:
+                        bucket[frag] = bucket.get(frag, 0) + 1
+        cleaned = {k: v for k, v in combined.items() if v}
+        return cleaned, dist.get_rank() == 0
+
+    def _buffer_append_fragment(self, smiles: Optional[str], is_peptide: bool):
+        if not smiles or self.rag_fragment_buffer is None:
+            return
+        key = 'peptide' if is_peptide else 'molecule'
+        buf = self.rag_fragment_buffer.get(key)
+        if buf is None:
+            return
+        buf.append(smiles)
+
+    def _buffer_store_fragments(self, smiles_list: List[Optional[str]], is_aa_flags: torch.Tensor):
+        if self.rag_fragment_buffer is None or not smiles_list:
+            return
+        try:
+            flags = is_aa_flags.detach().cpu().tolist()
+        except Exception:
+            flags = [bool(is_aa_flags)] * len(smiles_list)
+        for smi, flag in zip(smiles_list, flags):
+            self._buffer_append_fragment(smi, bool(flag))
+
+    def _buffer_sample_smiles(self, modality_key: str, k: int, exclude: Optional[set] = None) -> List[str]:
+        if (
+            self.rag_fragment_buffer is None
+            or modality_key not in self.rag_fragment_buffer
+            or k <= 0
+        ):
+            return []
+        buf = list(self.rag_fragment_buffer.get(modality_key) or [])
+        if not buf:
+            return []
+        exclude = exclude or set()
+        candidates = [s for s in buf if s and s not in exclude]
+        if not candidates:
+            return []
+        if len(candidates) <= k:
+            return random.sample(candidates, len(candidates))
+        return random.sample(candidates, k)
 
     def _update_contrastive_queue(self, pocket_repr, ligand_repr):
         if not self.use_contrastive_queue:
@@ -695,10 +800,9 @@ class CondIterAutoEncoder(nn.Module):
         residue_mask = (~generate_mask) & (is_aa if 'is_aa' in locals() else torch.zeros_like(generate_mask))
         if residue_mask.device != block_hidden_norm.device:
             residue_mask = residue_mask.to(block_hidden_norm.device)
-        residue_neg_emb = block_hidden_norm[residue_mask]
         fragment_encoder = getattr(self, 'subgraph_encoder', None)
 
-        def _sample_negative_embeddings(exclude_smiles, device, num_pos, extra_neg_emb=None, use_index=True):
+        def _sample_negative_embeddings(exclude_smiles, device, num_pos, extra_neg_emb=None, use_index=True, buffer_keys=None):
             """Collect negatives from retrieval/index and optionally extra embeddings."""
             neg_tensors: list[torch.Tensor] = []
             neg_smiles: list[str] = []
@@ -748,20 +852,69 @@ class CondIterAutoEncoder(nn.Module):
                 neg_emb = torch.cat(neg_tensors, dim=0).to(device, non_blocking=True)
             else:
                 neg_emb = torch.empty(0, block_hidden_norm.shape[-1], device=device)
+            buffer_targets = buffer_keys if buffer_keys is not None else ('molecule', 'peptide')
+            if (
+                neg_emb.shape[0] < target
+                and self.rag_fragment_buffer is not None
+                and fragment_encoder is not None
+            ):
+                needed = max(target - neg_emb.shape[0], 0)
+                exclude_set = set(exclude_smiles or [])
+                buffer_candidates: List[str] = []
+                remaining = needed
+                for key in buffer_targets:
+                    if remaining <= 0:
+                        break
+                    samples = self._buffer_sample_smiles(key, remaining, exclude_set)
+                    if samples:
+                        buffer_candidates.extend(samples)
+                        exclude_set.update(samples)
+                        remaining = max(remaining - len(samples), 0)
+                if buffer_candidates:
+                    try:
+                        fragment_encoder = fragment_encoder.to(device)
+                        encoded = fragment_encoder.encode_smiles_list(buffer_candidates, device=device)
+                        if encoded is not None and encoded.numel():
+                            encoded = F.normalize(encoded, dim=-1)
+                            neg_emb = torch.cat([neg_emb, encoded], dim=0)
+                            neg_smiles.extend(buffer_candidates)
+                    except Exception:
+                        pass
             return neg_emb, neg_smiles
 
-        def _rag_infonce(anchors, positives, temperature, exclude_smiles=None, source_types=None):
-            """Compute InfoNCE loss for dynamic fragments.
-
-            In-batch anchors are always treated as negatives first; if the
-            batch only provides a single fragment we fall back to samples from
-            the configured fragment indexes.  The returned ``infonote`` keeps
-            provenance of negatives so that the caller can surface precise
-            failure reasons in the training logs."""
+        def _rag_infonce(anchors, positives, temperature, exclude_smiles=None, source_types=None, positive_smiles=None,
+                         shared_negatives=None, shared_negative_types=None, shared_negative_smiles=None):
+            """Compute InfoNCE loss with per-anchor negative budgets."""
             if anchors is None or positives is None:
-                return None, 0, 0, {'reason': 'empty_inputs'}
+                info = {
+                    'reason': 'empty_inputs',
+                    'per_anchor_external': None,
+                    'per_anchor_inbatch': None,
+                    'top1_hits': 0,
+                    'top1_total': 0,
+                    'top1_acc': 0.0,
+                    'per_anchor_top1': [],
+                    'top5_hits': 0,
+                    'top5_total': 0,
+                    'top5_acc': 0.0,
+                    'per_anchor_top5': [],
+                }
+                return None, 0, 0, info
             if anchors.numel() == 0 or positives.numel() == 0:
-                return None, 0, 0, {'reason': 'empty_inputs'}
+                info = {
+                    'reason': 'empty_inputs',
+                    'per_anchor_external': None,
+                    'per_anchor_inbatch': None,
+                    'top1_hits': 0,
+                    'top1_total': 0,
+                    'top1_acc': 0.0,
+                    'per_anchor_top1': [],
+                    'top5_hits': 0,
+                    'top5_total': 0,
+                    'top5_acc': 0.0,
+                    'per_anchor_top5': [],
+                }
+                return None, 0, 0, info
             if anchors.shape[0] != positives.shape[0]:
                 mismatch = {
                     'reason': 'shape_mismatch',
@@ -774,26 +927,219 @@ class CondIterAutoEncoder(nn.Module):
                 raise ValueError(f"RAG InfoNCE expects equal counts, got {mismatch}")
             m = anchors.shape[0]
             if m == 0:
-                return None, 0, 0, {'reason': 'empty_inputs'}
+                info = {
+                    'reason': 'empty_inputs',
+                    'per_anchor_external': None,
+                    'per_anchor_inbatch': None,
+                    'top1_hits': 0,
+                    'top1_total': 0,
+                    'top1_acc': 0.0,
+                    'per_anchor_top1': [],
+                    'top5_hits': 0,
+                    'top5_total': 0,
+                    'top5_acc': 0.0,
+                    'per_anchor_top5': [],
+                }
+                return None, 0, 0, info
             positives = positives.to(anchors.device, non_blocking=True)
             pos_logits = torch.sum(anchors * positives, dim=-1, keepdim=True)
-            neg_chunks = []
-            # collect external negative smiles by modality for logging
-            neg_ext_molecule: list = []
-            neg_ext_peptide: list = []
-            # In-batch negatives first (other positives in the same batch)
-            if m > 1:
-                cross = torch.matmul(anchors, positives.t())
-                mask = torch.eye(m, device=anchors.device, dtype=torch.bool)
-                cross = cross.masked_fill(mask, float('-inf'))
-                neg_chunks.append(cross)
-
+            total_neg_base = int(max(self.rag_negatives_per_pos, 0))
+            if total_neg_base <= 0:
+                info = {
+                    'reason': 'negatives_disabled',
+                    'per_anchor_external': None,
+                    'per_anchor_inbatch': None,
+                    'top1_hits': 0,
+                    'top1_total': int(m),
+                    'top1_acc': 0.0,
+                    'per_anchor_top1': [False] * int(m),
+                    'top5_hits': 0,
+                    'top5_total': int(m),
+                    'top5_acc': 0.0,
+                    'per_anchor_top5': [False] * int(m),
+                }
+                return None, 0, 0, info
             try:
                 ratio = float(self.rag_cross_modal_neg_ratio or 0.0)
             except Exception:
                 ratio = 0.0
             ratio = max(0.0, min(1.0, ratio))
-
+            cross_target_base = int(round(total_neg_base * ratio))
+            cross_target_base = max(0, min(total_neg_base, cross_target_base))
+            same_target_base = max(0, total_neg_base - cross_target_base)
+            cross = torch.matmul(anchors, positives.t())
+            mask = torch.eye(m, device=anchors.device, dtype=torch.bool)
+            cross = cross.masked_fill(mask, float('-inf'))
+            if source_types is None:
+                source_list = [False] * m
+            else:
+                if isinstance(source_types, torch.Tensor):
+                    tmp = source_types.detach().cpu().tolist()
+                else:
+                    try:
+                        tmp = list(source_types)
+                    except Exception:
+                        tmp = None
+                if tmp is None:
+                    source_list = [False] * m
+                else:
+                    converted = []
+                    for item in tmp:
+                        if isinstance(item, bool):
+                            converted.append(item)
+                        elif item is None:
+                            converted.append(False)
+                        else:
+                            converted.append(bool(item))
+                    if len(converted) < m:
+                        converted.extend([False] * (m - len(converted)))
+                    source_list = converted[:m]
+            source_tensor = torch.tensor(source_list, device=anchors.device, dtype=torch.bool)
+            same_mask = (source_tensor.unsqueeze(1) == source_tensor.unsqueeze(0)) & (~mask)
+            cross_mask = (~same_mask) & (~mask)
+            pos_smiles_list = positive_smiles if positive_smiles is not None else (
+                list(exclude_smiles) if isinstance(exclude_smiles, (list, tuple)) else [None] * m
+            )
+            use_full_inbatch = bool(getattr(self, 'rag_use_full_inbatch_negatives', False))
+            same_cap = same_target_base
+            cross_cap = cross_target_base
+            if use_full_inbatch:
+                try:
+                    same_available = same_mask.sum(dim=1).detach().cpu()
+                except Exception:
+                    same_available = None
+                try:
+                    cross_available = cross_mask.sum(dim=1).detach().cpu()
+                except Exception:
+                    cross_available = None
+                if same_available is not None and same_available.numel():
+                    same_cap = max(same_cap, int(same_available.max().item()))
+                if cross_available is not None and cross_available.numel():
+                    cross_cap = max(cross_cap, int(cross_available.max().item()))
+            total_neg = same_cap + cross_cap
+            neg_matrix = torch.full(
+                (m, total_neg), float('-inf'), device=anchors.device, dtype=anchors.dtype
+            )
+            filled_same = [0] * m
+            filled_cross = [0] * m
+            remaining_same = [same_target_base] * m
+            remaining_cross = [cross_target_base] * m
+            per_anchor_external = {
+                'molecule': [[] for _ in range(m)],
+                'peptide': [[] for _ in range(m)],
+            }
+            per_anchor_inbatch = {
+                'molecule': [[] for _ in range(m)],
+                'peptide': [[] for _ in range(m)],
+            }
+            for i in range(m):
+                if same_cap > 0 and same_mask[i].any():
+                    same_idx = torch.nonzero(same_mask[i], as_tuple=False).view(-1)
+                    perm = torch.randperm(same_idx.shape[0], device=anchors.device)
+                    if use_full_inbatch:
+                        chosen = same_idx[perm]
+                    else:
+                        take = min(same_target_base, same_idx.shape[0])
+                        chosen = same_idx[perm[:take]]
+                    take = chosen.shape[0]
+                    if take > 0:
+                        logits = cross[i, chosen]
+                        neg_matrix[i, 0:take] = logits
+                        filled_same[i] = take
+                        remaining_same[i] = max(same_target_base - take, 0)
+                        if pos_smiles_list:
+                            chosen_idx = chosen.detach().cpu().tolist()
+                            negatives = [
+                                pos_smiles_list[idx] for idx in chosen_idx
+                                if 0 <= idx < len(pos_smiles_list) and pos_smiles_list[idx]
+                            ]
+                            if negatives:
+                                key = 'molecule' if source_list[i] else 'peptide'
+                                per_anchor_inbatch[key][i].extend(negatives)
+                if cross_cap > 0 and cross_mask[i].any():
+                    cross_idx = torch.nonzero(cross_mask[i], as_tuple=False).view(-1)
+                    perm = torch.randperm(cross_idx.shape[0], device=anchors.device)
+                    if use_full_inbatch:
+                        chosen = cross_idx[perm]
+                    else:
+                        take = min(cross_target_base, cross_idx.shape[0])
+                        chosen = cross_idx[perm[:take]]
+                    take = chosen.shape[0]
+                    if take > 0:
+                        logits = cross[i, chosen]
+                        start = same_cap
+                        neg_matrix[i, start:start + take] = logits
+                        filled_cross[i] = take
+                        remaining_cross[i] = max(cross_target_base - take, 0)
+                        if pos_smiles_list:
+                            chosen_idx = chosen.detach().cpu().tolist()
+                            negatives = [
+                                pos_smiles_list[idx] for idx in chosen_idx
+                                if 0 <= idx < len(pos_smiles_list) and pos_smiles_list[idx]
+                            ]
+                    if negatives:
+                        key = 'peptide' if source_list[i] else 'molecule'
+                        per_anchor_inbatch[key][i].extend(negatives)
+            if shared_negatives is not None and isinstance(shared_negatives, torch.Tensor) and shared_negatives.numel():
+                shared_tensor = F.normalize(shared_negatives.to(anchors.device, non_blocking=True), dim=-1)
+                shared_logits = torch.matmul(anchors, shared_tensor.t())
+                if shared_negative_types is None:
+                    shared_type_tensor = torch.zeros(shared_tensor.shape[0], dtype=torch.bool, device=anchors.device)
+                elif isinstance(shared_negative_types, torch.Tensor):
+                    shared_type_tensor = shared_negative_types.to(anchors.device, dtype=torch.bool)
+                else:
+                    shared_type_tensor = torch.tensor(list(shared_negative_types), device=anchors.device, dtype=torch.bool)
+                if shared_type_tensor.shape[0] < shared_tensor.shape[0]:
+                    pad = shared_tensor.shape[0] - shared_type_tensor.shape[0]
+                    shared_type_tensor = torch.cat(
+                        [shared_type_tensor, torch.zeros(pad, dtype=torch.bool, device=anchors.device)], dim=0
+                    )
+                elif shared_type_tensor.shape[0] > shared_tensor.shape[0]:
+                    shared_type_tensor = shared_type_tensor[:shared_tensor.shape[0]]
+                shared_same_mask = (source_tensor.unsqueeze(1) == shared_type_tensor.unsqueeze(0))
+                shared_cross_mask = (~shared_same_mask)
+                shared_smiles_list = list(shared_negative_smiles) if isinstance(shared_negative_smiles, list) else []
+                for i in range(m):
+                    if remaining_same[i] > 0 and shared_same_mask.shape[1] and shared_same_mask[i].any():
+                        same_idx = torch.nonzero(shared_same_mask[i], as_tuple=False).view(-1)
+                        if same_idx.numel():
+                            perm = torch.randperm(same_idx.shape[0], device=anchors.device)
+                            take = min(remaining_same[i], same_idx.shape[0])
+                            chosen = same_idx[perm[:take]]
+                            logits = shared_logits[i, chosen]
+                            start = filled_same[i]
+                            neg_matrix[i, start:start + take] = logits
+                            filled_same[i] += take
+                            remaining_same[i] -= take
+                            if shared_smiles_list:
+                                chosen_idx = chosen.detach().cpu().tolist()
+                                negatives = [
+                                    shared_smiles_list[idx] for idx in chosen_idx
+                                    if 0 <= idx < len(shared_smiles_list) and shared_smiles_list[idx]
+                                ]
+                                if negatives:
+                                    key = 'molecule' if source_list[i] else 'peptide'
+                                    per_anchor_inbatch[key][i].extend(negatives)
+                    if remaining_cross[i] > 0 and shared_cross_mask.shape[1] and shared_cross_mask[i].any():
+                        cross_idx = torch.nonzero(shared_cross_mask[i], as_tuple=False).view(-1)
+                        if cross_idx.numel():
+                            perm = torch.randperm(cross_idx.shape[0], device=anchors.device)
+                            take = min(remaining_cross[i], cross_idx.shape[0])
+                            chosen = cross_idx[perm[:take]]
+                            logits = shared_logits[i, chosen]
+                            start = same_cap + filled_cross[i]
+                            neg_matrix[i, start:start + take] = logits
+                            filled_cross[i] += take
+                            remaining_cross[i] -= take
+                            if shared_smiles_list:
+                                chosen_idx = chosen.detach().cpu().tolist()
+                                negatives = [
+                                    shared_smiles_list[idx] for idx in chosen_idx
+                                    if 0 <= idx < len(shared_smiles_list) and shared_smiles_list[idx]
+                                ]
+                                if negatives:
+                                    key = 'peptide' if source_list[i] else 'molecule'
+                                    per_anchor_inbatch[key][i].extend(negatives)
             def _index_has_entries(index_obj):
                 if index_obj is None:
                     return False
@@ -802,64 +1148,22 @@ class CondIterAutoEncoder(nn.Module):
                 if hasattr(index_obj, 'smiles_list'):
                     return bool(index_obj.smiles_list)
                 return True
-
-            cross_modal_enabled = (
-                ratio > 0.0
-                and source_types is not None
-                and (getattr(self, 'rag_index', None) is not None or getattr(self, 'rag_cross_index', None) is not None)
-                and self.rag_negatives_per_pos > 0
-            )
-
-            source_list = None
-            if cross_modal_enabled:
-                if isinstance(source_types, torch.Tensor):
-                    source_list = source_types.detach().cpu().tolist()
-                else:
-                    try:
-                        source_list = list(source_types)
-                    except Exception:
-                        source_list = None
-                if source_list:
-                    converted = []
-                    for item in source_list:
-                        if isinstance(item, bool):
-                            converted.append(item)
-                        elif item is None:
-                            converted.append(False)
-                        else:
-                            converted.append(bool(item))
-                    source_list = converted[:m]
-                    if len(source_list) < m and source_list:
-                        source_list.extend([source_list[-1]] * (m - len(source_list)))
-                if not source_list:
-                    cross_modal_enabled = False
-                else:
-                    need_molecule_cross = any(flag is True for flag in source_list)
-                    need_peptide_cross = any(flag is False for flag in source_list)
-                    has_cross_candidates = False
-                    if need_molecule_cross:
-                        idx_obj = getattr(self, 'rag_cross_index', None)
-                        if _index_has_entries(idx_obj):
-                            has_cross_candidates = True
-                    if need_peptide_cross:
-                        idx_obj = getattr(self, 'rag_index', None)
-                        if _index_has_entries(idx_obj):
-                            has_cross_candidates = True
-                    if not has_cross_candidates:
-                        cross_modal_enabled = False
-
             def _encode_smiles_for_neg(smiles_list):
                 if not smiles_list:
                     return None
+                encoder = getattr(self, 'subgraph_encoder', None)
+                if encoder is None:
+                    return None
                 try:
-                    if fragment_encoder is not None:
-                        fragment_encoder.to(anchors.device)
-                        emb = fragment_encoder.encode_smiles_list(smiles_list, device=anchors.device)
-                        return F.normalize(emb, dim=-1)
+                    device = anchors.device
+                    encoder = encoder.to(device)
+                    with torch.no_grad():
+                        emb = encoder.encode_smiles_list(smiles_list, device=device)
+                        if emb is not None and emb.numel():
+                            return F.normalize(emb, dim=-1)
                 except Exception:
                     return None
                 return None
-
             def _draw_from_index(index_obj, k, exclude):
                 if index_obj is None or k <= 0:
                     return []
@@ -880,82 +1184,91 @@ class CondIterAutoEncoder(nn.Module):
                     if len(result) >= k:
                         break
                 return result
-
-            if cross_modal_enabled:
-                neg_tensors = []
-                total_capacity = int(max(self.rag_negatives_per_pos, 0) * max(1, m))
-                total_added = 0
-                exclude_set = set(exclude_smiles or [])
-                for is_molecule in (True, False):
-                    group_indices = [i for i, flag in enumerate(source_list) if flag is is_molecule]
-                    if not group_indices:
-                        continue
-                    group_target = int(max(self.rag_negatives_per_pos, 0) * len(group_indices))
-                    if group_target <= 0:
-                        continue
-                    cross_index_obj = getattr(self, 'rag_cross_index', None) if is_molecule else getattr(self, 'rag_index', None)
-                    same_index_obj = getattr(self, 'rag_index', None) if is_molecule else getattr(self, 'rag_cross_index', None)
-                    cross_target = int(round(group_target * ratio))
-                    if cross_target > 0 and not _index_has_entries(cross_index_obj):
-                        cross_target = 0
-                    inmodal_target = max(group_target - cross_target, 0)
-
-                    if inmodal_target > 0:
-                        if inmodal_target > 0 and _index_has_entries(same_index_obj):
-                            same_smiles = _draw_from_index(same_index_obj, inmodal_target, exclude_set)
-                            cand = _encode_smiles_for_neg(same_smiles)
-                            if cand is not None and cand.numel():
-                                neg_tensors.append(cand)
-                                total_added += cand.shape[0]
-                                exclude_set.update(same_smiles)
-                            if same_index_obj is getattr(self, 'rag_index', None):
-                                neg_ext_molecule.extend([s for s in (same_smiles or []) if s])
-                            elif same_index_obj is getattr(self, 'rag_cross_index', None):
-                                neg_ext_peptide.extend([s for s in (same_smiles or []) if s])
-
-                    if cross_target > 0:
-                        cross_smiles = _draw_from_index(cross_index_obj, cross_target, exclude_set)
-                        cand = _encode_smiles_for_neg(cross_smiles)
-                        if cand is not None and cand.numel():
-                            neg_tensors.append(cand)
-                            total_added += cand.shape[0]
-                            exclude_set.update(cross_smiles)
-                            if cross_index_obj is getattr(self, 'rag_index', None):
-                                neg_ext_molecule.extend([s for s in (cross_smiles or []) if s])
-                            elif cross_index_obj is getattr(self, 'rag_cross_index', None):
-                                neg_ext_peptide.extend([s for s in (cross_smiles or []) if s])
-
-                if residue_neg_emb is not None and residue_neg_emb.numel():
-                    extra = residue_neg_emb.to(anchors.device, non_blocking=True)
-                    remaining = max(total_capacity - total_added, 0)
-                    if 0 < remaining < extra.shape[0]:
-                        idx = torch.randperm(extra.shape[0], device=extra.device)[:remaining]
-                        extra = extra[idx]
-                    if extra.numel():
-                        neg_tensors.append(extra)
-
-                if neg_tensors:
-                    neg_emb = torch.cat(neg_tensors, dim=0)
-                    neg_chunks.append(torch.matmul(anchors, neg_emb.t()))
-            else:
-                need_external = (m <= 1)
-                neg_emb, neg_smiles = _sample_negative_embeddings(
-                    exclude_smiles or [],
-                    anchors.device,
-                    m,
-                    extra_neg_emb=residue_neg_emb,
-                    use_index=need_external
-                )
-                if neg_emb.numel():
-                    neg_chunks.append(torch.matmul(anchors, neg_emb.t()))
-                    if neg_smiles:
-                        neg_ext_molecule.extend([s for s in neg_smiles if s])
-
-            if not neg_chunks:
+            def _fill_external_for_anchor(anchor_idx, start_col, need, modality_key, exclude_set, neg_ext_mol, neg_ext_pep):
+                if need <= 0:
+                    return 0, []
+                filled = 0
+                fragments = []
+                # Priority: (1) in-memory fragment buffer with freshest positives,
+                # (2) disk-backed fragment index (subgraph/cross index).
+                if self.rag_fragment_buffer is not None:
+                    buf_samples = self._buffer_sample_smiles(modality_key, need, exclude_set)
+                    if buf_samples:
+                        fragments.extend(buf_samples)
+                        exclude_set.update(buf_samples)
+                if len(fragments) < need:
+                    index_obj = self.rag_index if modality_key == 'molecule' else self.rag_cross_index
+                    if _index_has_entries(index_obj):
+                        more = _draw_from_index(index_obj, need - len(fragments), exclude_set)
+                        if more:
+                            fragments.extend(more)
+                            exclude_set.update(more)
+                used_smiles: List[str] = []
+                if fragments:
+                    cand = _encode_smiles_for_neg(fragments)
+                    if cand is not None and cand.numel():
+                        cand = cand.to(anchors.device)
+                        dots = torch.matmul(cand, anchors[anchor_idx])
+                        take = min(dots.shape[0], need)
+                        neg_matrix[anchor_idx, start_col:start_col + take] = dots[:take]
+                        filled += take
+                        selected = fragments[:take]
+                        used_smiles.extend(selected)
+                        if modality_key == 'molecule':
+                            neg_ext_mol.extend(selected)
+                        else:
+                            neg_ext_pep.extend(selected)
+                # NOTE: deliberately avoid falling back to residue_neg_emb (current targets)
+                # to ensure positives are never recycled as negatives. If this fallback ever
+                # needs to return, guard it with a config flag and document the implications.
+                return filled, used_smiles
+            neg_ext_molecule = []
+            neg_ext_peptide = []
+            for i in range(m):
+                anchor_modality = 'molecule' if source_list[i] else 'peptide'
+                excl = set()
+                if isinstance(exclude_smiles, (list, tuple)):
+                    if i < len(exclude_smiles) and exclude_smiles[i]:
+                        excl.add(exclude_smiles[i])
+                elif exclude_smiles:
+                    if isinstance(exclude_smiles, str):
+                        excl.add(exclude_smiles)
+                    else:
+                        excl.update(exclude_smiles)
+                if remaining_same[i] > 0:
+                    start = filled_same[i]
+                    filled, used_smiles = _fill_external_for_anchor(
+                        i, start, remaining_same[i], anchor_modality, excl, neg_ext_molecule, neg_ext_peptide
+                    )
+                    if used_smiles:
+                        per_anchor_external[anchor_modality][i].extend(used_smiles)
+                    filled_same[i] += filled
+                    remaining_same[i] -= filled
+                if remaining_cross[i] > 0:
+                    cross_mod = 'peptide' if anchor_modality == 'molecule' else 'molecule'
+                    start = same_cap + filled_cross[i]
+                    filled, used_smiles = _fill_external_for_anchor(
+                        i, start, remaining_cross[i], cross_mod, excl, neg_ext_molecule, neg_ext_peptide
+                    )
+                    if used_smiles:
+                        per_anchor_external[cross_mod][i].extend(used_smiles)
+                    filled_cross[i] += filled
+                    remaining_cross[i] -= filled
+            if not torch.isfinite(neg_matrix).any():
                 info = {
                     'reason': 'no_negatives',
                     'count': m,
                     'exclude_smiles': list(exclude_smiles) if exclude_smiles else [],
+                    'per_anchor_external': per_anchor_external,
+                    'per_anchor_inbatch': per_anchor_inbatch,
+                    'top1_hits': 0,
+                    'top1_total': int(m),
+                    'top1_acc': 0.0,
+                    'per_anchor_top1': [False] * int(m),
+                    'top5_hits': 0,
+                    'top5_total': int(m),
+                    'top5_acc': 0.0,
+                    'per_anchor_top5': [False] * int(m),
                 }
                 if self.rag_debug:
                     from utils.logger import print_log
@@ -964,17 +1277,160 @@ class CondIterAutoEncoder(nn.Module):
                         level='WARN'
                     )
                 return None, m, 0, info
-            neg_logits = torch.cat(neg_chunks, dim=1)
-            logits = torch.cat([pos_logits, neg_logits], dim=1) / max(temperature, 1e-6)
+            logits = torch.cat([pos_logits, neg_matrix], dim=1) / max(temperature, 1e-6)
             labels = torch.zeros(m, dtype=torch.long, device=anchors.device)
             per_row_loss = F.cross_entropy(logits, labels, reduction='none')
             loss = per_row_loss.mean()
+            per_row_loss_detached = per_row_loss.detach()
+            if per_row_loss_detached.numel() > 0:
+                mean_loss = float(per_row_loss_detached.mean().item())
+                max_loss = float(per_row_loss_detached.max().item())
+                min_loss = float(per_row_loss_detached.min().item())
+                std_loss = float(per_row_loss_detached.std().item()) if per_row_loss_detached.numel() > 1 else 0.0
+            else:
+                mean_loss = max_loss = min_loss = std_loss = 0.0
+            def _summarize_usage(values):
+                if not values:
+                    return {'mean': 0.0, 'max': 0, 'min': 0}
+                return {
+                    'mean': float(sum(values) / float(len(values))),
+                    'max': int(max(values)),
+                    'min': int(min(values)),
+                }
+            usage_stats = {
+                'same': _summarize_usage(filled_same),
+                'cross': _summarize_usage(filled_cross),
+                'target_same': int(same_target_base),
+                'target_cross': int(cross_target_base),
+                'capacity_same': int(same_cap),
+                'capacity_cross': int(cross_cap),
+            }
+            preds = torch.argmax(logits, dim=-1)
+            correct = (preds == 0)
+            top1_hits = int(correct.sum().item())
+            top1_total = int(m)
+            top1_acc = float(top1_hits / top1_total) if top1_total > 0 else 0.0
+            if logits.shape[1] > 0:
+                topk = min(5, logits.shape[1])
+                topk_indices = torch.topk(logits, k=topk, dim=-1).indices
+                top5_mask = (topk_indices == 0)
+                if top5_mask.ndim > 1:
+                    top5_mask = top5_mask.any(dim=-1)
+            else:
+                top5_mask = torch.zeros_like(correct, dtype=torch.bool)
+            top5_hits = int(top5_mask.sum().item())
+            top5_total = int(m)
+            top5_acc = float(top5_hits / top5_total) if top5_total > 0 else 0.0
             info = {
                 'neg_ext_molecule': list({s for s in neg_ext_molecule})[:20],
                 'neg_ext_peptide': list({s for s in neg_ext_peptide})[:20],
                 'per_row_loss': per_row_loss.detach().cpu().tolist(),
+                'per_anchor_external': per_anchor_external,
+                'per_anchor_inbatch': per_anchor_inbatch,
+                'per_row_loss_stats': {
+                    'mean': mean_loss,
+                    'max': max_loss,
+                    'min': min_loss,
+                    'std': std_loss,
+                },
+                'neg_usage_stats': usage_stats,
+                'top1_hits': top1_hits,
+                'top1_total': top1_total,
+                'top1_acc': top1_acc,
+                'per_anchor_top1': correct.detach().cpu().tolist(),
+                'top5_hits': top5_hits,
+                'top5_total': top5_total,
+                'top5_acc': top5_acc,
+                'per_anchor_top5': top5_mask.detach().cpu().tolist(),
             }
-            return loss, m, neg_logits.shape[1], info
+            return loss, m, neg_matrix.shape[1], info
+
+        def _gather_remote_inbatch_negatives(local_embeddings, anchor_type_flags, smiles_payload):
+            if not getattr(self, 'rag_share_inbatch_negatives', False):
+                return None, None, None
+            if not dist.is_available() or not dist.is_initialized():
+                return None, None, None
+            world_size = dist.get_world_size()
+            if world_size <= 1:
+                return None, None, None
+            device = local_embeddings.device
+            local_count = int(local_embeddings.shape[0])
+            hidden = local_embeddings.shape[-1]
+            count_tensor = torch.tensor([local_count], device=device, dtype=torch.long)
+            size_list = [torch.zeros_like(count_tensor) for _ in range(world_size)]
+            dist.all_gather(size_list, count_tensor)
+            max_count = int(torch.stack(size_list).max().item())
+            if max_count == 0:
+                return None, None, None
+            padded = local_embeddings.new_zeros(max_count, hidden)
+            if local_count:
+                padded[:local_count] = local_embeddings.detach()
+            gather_buffer = [local_embeddings.new_zeros(max_count, hidden) for _ in range(world_size)]
+            dist.all_gather(gather_buffer, padded)
+            flag_tensor = anchor_type_flags.to(torch.uint8)
+            padded_flag = torch.zeros(max_count, dtype=torch.uint8, device=device)
+            if local_count:
+                padded_flag[:local_count] = flag_tensor
+            flag_buffer = [torch.zeros_like(padded_flag) for _ in range(world_size)]
+            dist.all_gather(flag_buffer, padded_flag)
+            smiles_list = []
+            if isinstance(smiles_payload, list):
+                smiles_list = list(smiles_payload)
+            elif smiles_payload:
+                smiles_list = list(smiles_payload)
+            gathered_smiles = [None for _ in range(world_size)]
+            dist.all_gather_object(gathered_smiles, smiles_list)
+            rank = dist.get_rank()
+            shared_emb_chunks = []
+            shared_flag_chunks = []
+            shared_smiles = []
+            for idx in range(world_size):
+                if idx == rank:
+                    continue
+                count = int(size_list[idx].item())
+                if count <= 0:
+                    continue
+                shared_emb_chunks.append(gather_buffer[idx][:count].detach())
+                shared_flag_chunks.append(flag_buffer[idx][:count].to(device=device, dtype=torch.bool))
+                remote_smiles = gathered_smiles[idx]
+                if not isinstance(remote_smiles, list):
+                    remote_smiles = []
+                if len(remote_smiles) < count:
+                    remote_smiles = remote_smiles + [None] * (count - len(remote_smiles))
+                else:
+                    remote_smiles = remote_smiles[:count]
+                shared_smiles.extend(remote_smiles)
+            if not shared_emb_chunks:
+                return None, None, None
+            shared_emb = torch.cat(shared_emb_chunks, dim=0)
+            shared_flags = torch.cat(shared_flag_chunks, dim=0)
+            return shared_emb, shared_flags, shared_smiles
+
+        def _merge_unique_smiles(existing, new_values, limit):
+            """Order-preserving merge without duplicates/None entries."""
+            merged = []
+            seen = set()
+
+            def _append(seq):
+                if not seq:
+                    return False
+                for smi in seq:
+                    if not smi or smi in seen:
+                        continue
+                    seen.add(smi)
+                    merged.append(smi)
+                    if limit is not None and limit > 0 and len(merged) >= limit:
+                        return True
+                return False
+
+            if limit is None or limit <= 0:
+                _append(existing)
+                _append(new_values)
+                return merged
+            if _append(existing):
+                return merged[:limit]
+            _append(new_values)
+            return merged[:limit]
 
 
         # Optional: RAG contrastive between decoder block embeddings and 2D fragment encodings
@@ -982,6 +1438,22 @@ class CondIterAutoEncoder(nn.Module):
         rag_pos_count_molecule = 0.0
         rag_pos_count_peptide = 0.0
         rag_source_count = 0
+        rag_infonce_info = None
+        rag_loss_applied = False
+        rag_top1_hits = 0.0
+        rag_top1_total = 0.0
+        rag_top1_hits_molecule = 0.0
+        rag_top1_total_molecule = 0.0
+        rag_top1_hits_peptide = 0.0
+        rag_top1_total_peptide = 0.0
+        rag_top5_hits = 0.0
+        rag_top5_total = 0.0
+        rag_top5_hits_molecule = 0.0
+        rag_top5_total_molecule = 0.0
+        rag_top5_hits_peptide = 0.0
+        rag_top5_total_peptide = 0.0
+        rag_positive_frequency = {'molecule': {}, 'peptide': {}}
+        rag_fragment_frequency = {'molecule': {}, 'peptide': {}}
         if self.rag_enabled:
             rag_source_smiles = kwargs.get('rag_source_smiles', None)
             rag_source_list = []
@@ -1004,6 +1476,7 @@ class CondIterAutoEncoder(nn.Module):
             rag_pool_pos_candidates = 0
             rag_debug_error = 0
             dyn_fragments_per_sample = {}
+            actual_pos_fragments_per_sample: dict[int, list[str]] = {}
             skip_reason_map = {}
             # new: per-sample negative record and per-sample contrastive loss
             rag_per_sample_loss = {}
@@ -1066,6 +1539,7 @@ class CondIterAutoEncoder(nn.Module):
                                 from utils.logger import print_log
                                 print_log(f"[RAG] anchors device mismatch: anchors={anchors.device}, hidden={block_hidden_norm.device}", level='WARN')
                             pos_smiles = [dyn_fragment_smiles[i] for i in rag_indices]
+                            self._buffer_store_fragments(pos_smiles, is_aa[anchor_idx])
                             pos_emb = None
                             if fragment_encoder is not None:
                                 frag_device = anchors.device
@@ -1113,13 +1587,27 @@ class CondIterAutoEncoder(nn.Module):
                                         source_flags.append(True)
                                     else:
                                         source_flags.append(False)
+                            shared_neg_emb = None
+                            shared_neg_types = None
+                            shared_neg_smiles = None
+                            if getattr(self, 'rag_share_inbatch_negatives', False) and anchor_idx.numel():
+                                anchor_type_flags = is_aa[anchor_idx].to(torch.bool)
+                                shared_neg_emb, shared_neg_types, shared_neg_smiles = _gather_remote_inbatch_negatives(
+                                    pos_emb, anchor_type_flags, pos_smiles
+                                )
                             loss_val, used, negs, infonote = _rag_infonce(
                                 anchors,
                                 pos_emb,
                                 self.rag_temperature,
                                 exclude_smiles=pos_smiles,
-                                source_types=source_flags
+                                source_types=source_flags,
+                                positive_smiles=pos_smiles,
+                                shared_negatives=shared_neg_emb,
+                                shared_negative_types=shared_neg_types,
+                                shared_negative_smiles=shared_neg_smiles
                             )
+                            if isinstance(infonote, dict):
+                                rag_infonce_info = infonote
                         else:
                             if self.rag_debug:
                                 from utils.logger import print_log
@@ -1160,13 +1648,83 @@ class CondIterAutoEncoder(nn.Module):
                                 selected_idx = anchor_idx[:used]
                                 sample_indices = batch_ids[selected_idx.detach().cpu()].tolist()
                                 anchor_flags = is_aa[selected_idx][:used].detach().cpu().tolist()
-                                for si, flag in zip(sample_indices, anchor_flags):
-                                    if 0 <= si < batch_size:
-                                        positive_mask[si] = True
+                                per_anchor_top1 = []
+                                try:
+                                    per_anchor_top1 = infonote.get('per_anchor_top1') if isinstance(infonote, dict) else []
+                                except Exception:
+                                    per_anchor_top1 = []
+                                if isinstance(per_anchor_top1, torch.Tensor):
+                                    per_anchor_top1 = per_anchor_top1.detach().cpu().tolist()
+                                elif not isinstance(per_anchor_top1, list):
+                                    per_anchor_top1 = []
+                                per_anchor_top5 = []
+                                try:
+                                    per_anchor_top5 = infonote.get('per_anchor_top5') if isinstance(infonote, dict) else []
+                                except Exception:
+                                    per_anchor_top5 = []
+                                if isinstance(per_anchor_top5, torch.Tensor):
+                                    per_anchor_top5 = per_anchor_top5.detach().cpu().tolist()
+                                elif not isinstance(per_anchor_top5, list):
+                                    per_anchor_top5 = []
+                                for idx_local, (si, flag) in enumerate(zip(sample_indices, anchor_flags)):
+                                    if not (0 <= si < batch_size):
+                                        continue
+                                    positive_mask[si] = True
+                                    if flag:
+                                        rag_pos_count_peptide += 1.0
+                                    else:
+                                        rag_pos_count_molecule += 1.0
+                                    freq_key = 'peptide' if flag else 'molecule'
+                                    freq_map = rag_positive_frequency.get(freq_key, {})
+                                    sample_id_val = sample_ids[si] if 0 <= si < len(sample_ids) else None
+                                    if sample_id_val is None:
+                                        sample_label = f'index_{si}'
+                                    else:
+                                        try:
+                                            sample_label = str(sample_id_val)
+                                        except Exception:
+                                            sample_label = repr(sample_id_val)
+                                    freq_map[sample_label] = freq_map.get(sample_label, 0) + 1
+                                    rag_positive_frequency[freq_key] = freq_map
+                                    rag_top1_total += 1.0
+                                    if flag:
+                                        rag_top1_total_peptide += 1.0
+                                    else:
+                                        rag_top1_total_molecule += 1.0
+                                    rag_top5_total += 1.0
+                                    if flag:
+                                        rag_top5_total_peptide += 1.0
+                                    else:
+                                        rag_top5_total_molecule += 1.0
+                                    hit = False
+                                    if idx_local < len(per_anchor_top1):
+                                        hit = bool(per_anchor_top1[idx_local])
+                                    if hit:
+                                        rag_top1_hits += 1.0
                                         if flag:
-                                            rag_pos_count_peptide += 1.0
+                                            rag_top1_hits_peptide += 1.0
                                         else:
-                                            rag_pos_count_molecule += 1.0
+                                            rag_top1_hits_molecule += 1.0
+                                    hit5 = False
+                                    if idx_local < len(per_anchor_top5):
+                                        hit5 = bool(per_anchor_top5[idx_local])
+                                    if hit5:
+                                        rag_top5_hits += 1.0
+                                        if flag:
+                                            rag_top5_hits_peptide += 1.0
+                                        else:
+                                            rag_top5_hits_molecule += 1.0
+                                    frag_smi = pos_smiles[idx_local] if idx_local < len(pos_smiles) else None
+                                    if frag_smi:
+                                        frag_source = 'peptide' if flag else 'molecule'
+                                        frag_map = rag_fragment_frequency.get(frag_source, {})
+                                        frag_map[frag_smi] = frag_map.get(frag_smi, 0) + 1
+                                        rag_fragment_frequency[frag_source] = frag_map
+                                        total_map = self._rag_fragment_totals.get(frag_source, {})
+                                        total_map[frag_smi] = total_map.get(frag_smi, 0) + 1
+                                        self._rag_fragment_totals[frag_source] = total_map
+                                        actual_pos_fragments_per_sample.setdefault(si, []).append(frag_smi)
+
                                 # per-sample loss from InfoNCE (if provided)
                                 per_row = None
                                 try:
@@ -1188,36 +1746,10 @@ class CondIterAutoEncoder(nn.Module):
                                         ext_pep = list(infonote.get('neg_ext_peptide', []) or [])
                                 except Exception:
                                     ext_mol, ext_pep = [], []
-                                # in-batch negatives: other positives in this group
-                                # derive modalities for in-batch via source_flags
-                                in_batch_lists = []
-                                try:
-                                    # recompute source_flags for safety
-                                    recompute_flags = []
-                                    if anchor_idx.numel():
-                                        try:
-                                            sample_indices_all = batch_ids[anchor_idx.detach().cpu()].tolist()
-                                        except Exception:
-                                            sample_indices_all = batch_ids[anchor_idx.long()].detach().cpu().tolist()
-                                        for si2 in sample_indices_all:
-                                            if 0 <= si2 < len(rag_source_list) and rag_source_list[si2]:
-                                                recompute_flags.append(True)
-                                            else:
-                                                recompute_flags.append(False)
-                                    for i_local, si in enumerate(sample_indices):
-                                        inb_mol = []
-                                        inb_pep = []
-                                        for j_local, smi in enumerate(pos_smiles[:min(len(pos_smiles), used)]):
-                                            if j_local == i_local or not smi:
-                                                continue
-                                            if j_local < len(recompute_flags) and recompute_flags[j_local]:
-                                                inb_mol.append(smi)
-                                            else:
-                                                inb_pep.append(smi)
-                                        in_batch_lists.append((si, i_local, inb_mol[:10], inb_pep[:10]))
-                                except Exception:
-                                    in_batch_lists = []
-                                # merge into rag_negatives_map per sample
+                                # in-batch negatives: prefer actual selections returned by _rag_infonce
+                                per_fragment_inbatch = {}
+                                anchor_inbatch_info = infonote.get('per_anchor_inbatch') if isinstance(infonote, dict) else None
+                                anchor_external_info = infonote.get('per_anchor_external') if isinstance(infonote, dict) else {}
                                 for si in sample_indices:
                                     rec = rag_negatives_map.get(si, {})
                                     rec.setdefault('external', {})
@@ -1225,30 +1757,43 @@ class CondIterAutoEncoder(nn.Module):
                                     rec.setdefault('per_fragment', [])
                                     if ext_mol:
                                         prev = rec['external'].get('molecule', [])
-                                        rec['external']['molecule'] = (prev + ext_mol)[:20]
+                                        rec['external']['molecule'] = _merge_unique_smiles(prev, ext_mol, None)
                                     if ext_pep:
                                         prev = rec['external'].get('peptide', [])
-                                        rec['external']['peptide'] = (prev + ext_pep)[:20]
+                                        rec['external']['peptide'] = _merge_unique_smiles(prev, ext_pep, None)
                                     rag_negatives_map[si] = rec
-                                per_fragment_inbatch = {}
-                                for si, i_local, inb_mol, inb_pep in in_batch_lists:
-                                    rec = rag_negatives_map.get(si, {})
-                                    rec.setdefault('external', {})
-                                    rec.setdefault('in_batch', {})
-                                    rec.setdefault('per_fragment', [])
-                                    if inb_mol:
-                                        prev = rec['in_batch'].get('molecule', [])
-                                        rec['in_batch']['molecule'] = (prev + inb_mol)[:20]
-                                    if inb_pep:
-                                        prev = rec['in_batch'].get('peptide', [])
-                                        rec['in_batch']['peptide'] = (prev + inb_pep)[:20]
-                                    per_fragment_inbatch[(si, i_local)] = {
-                                        'molecule': list(inb_mol[:10]),
-                                        'peptide': list(inb_pep[:10]),
-                                    }
-                                    rag_negatives_map[si] = rec
-                                ext_mol_unique = list({s for s in ext_mol})[:10]
-                                ext_pep_unique = list({s for s in ext_pep})[:10]
+                                if isinstance(anchor_inbatch_info, dict):
+                                    mol_lists = anchor_inbatch_info.get('molecule')
+                                    pep_lists = anchor_inbatch_info.get('peptide')
+                                    for i_local, si in enumerate(sample_indices):
+                                        rec = rag_negatives_map.get(si, {})
+                                        rec.setdefault('external', {})
+                                        rec.setdefault('in_batch', {})
+                                        rec.setdefault('per_fragment', [])
+                                        mol_vals = []
+                                        pep_vals = []
+                                        if isinstance(mol_lists, list) and i_local < len(mol_lists):
+                                            mol_vals = mol_lists[i_local] or []
+                                        if isinstance(pep_lists, list) and i_local < len(pep_lists):
+                                            pep_vals = pep_lists[i_local] or []
+                                        if mol_vals:
+                                            prev = rec['in_batch'].get('molecule', [])
+                                        rec['in_batch']['molecule'] = _merge_unique_smiles(prev, mol_vals, None)
+                                        if pep_vals:
+                                            prev = rec['in_batch'].get('peptide', [])
+                                        rec['in_batch']['peptide'] = _merge_unique_smiles(prev, pep_vals, None)
+                                        per_fragment_inbatch[(si, i_local)] = {
+                                        'molecule': _merge_unique_smiles([], mol_vals, None),
+                                        'peptide': _merge_unique_smiles([], pep_vals, None),
+                                        }
+                                        rag_negatives_map[si] = rec
+                                else:
+                                    if self.rag_debug:
+                                        try:
+                                            from utils.logger import print_log
+                                            print_log('[RAG] per_anchor_inbatch missing; per_fragment in-batch negatives omitted for this batch', level='WARN')
+                                        except Exception:
+                                            pass
                                 for i_local, (si, frag_smi) in enumerate(zip(sample_indices, pos_smiles[:len(sample_indices)])):
                                     if not frag_smi or si < 0 or si >= batch_size:
                                         continue
@@ -1257,15 +1802,31 @@ class CondIterAutoEncoder(nn.Module):
                                     rec.setdefault('in_batch', {})
                                     rec.setdefault('per_fragment', [])
                                     frag_inbatch = per_fragment_inbatch.get((si, i_local), {'molecule': [], 'peptide': []})
+                                    anchor_mol_ext = []
+                                    anchor_pep_ext = []
+                                    if isinstance(anchor_external_info, dict):
+                                        mol_lists = anchor_external_info.get('molecule')
+                                        pep_lists = anchor_external_info.get('peptide')
+                                        if isinstance(mol_lists, list) and i_local < len(mol_lists):
+                                            anchor_mol_ext = mol_lists[i_local] or []
+                                        if isinstance(pep_lists, list) and i_local < len(pep_lists):
+                                            anchor_pep_ext = pep_lists[i_local] or []
+                                    frag_external = {
+                                        'molecule': _merge_unique_smiles([], anchor_mol_ext, None),
+                                        'peptide': _merge_unique_smiles([], anchor_pep_ext, None),
+                                    }
+                                    if frag_external['molecule']:
+                                        prev = rec['external'].get('molecule', [])
+                                        rec['external']['molecule'] = _merge_unique_smiles(prev, frag_external['molecule'], None)
+                                    if frag_external['peptide']:
+                                        prev = rec['external'].get('peptide', [])
+                                        rec['external']['peptide'] = _merge_unique_smiles(prev, frag_external['peptide'], None)
                                     frag_entry = {
                                         'fragment_smiles': frag_smi,
-                                        'external': {
-                                            'molecule': ext_mol_unique,
-                                            'peptide': ext_pep_unique,
-                                        },
+                                        'external': frag_external,
                                         'in_batch': {
-                                            'molecule': list(frag_inbatch.get('molecule', [])),
-                                            'peptide': list(frag_inbatch.get('peptide', [])),
+                                            'molecule': _merge_unique_smiles([], frag_inbatch.get('molecule', []), None),
+                                            'peptide': _merge_unique_smiles([], frag_inbatch.get('peptide', []), None),
                                         },
                                     }
                                     rec['per_fragment'].append(frag_entry)
@@ -1338,6 +1899,7 @@ class CondIterAutoEncoder(nn.Module):
         zero_records = []
         if self.rag_enabled:
             current_epoch = kwargs.get('current_epoch', None)
+            current_step = kwargs.get('global_step', None)
             zero_every = getattr(self, 'rag_zero_log_every', 1)
             for idx in zero_indices:
                 if not (0 <= idx < batch_size):
@@ -1380,6 +1942,11 @@ class CondIterAutoEncoder(nn.Module):
                         record['negatives'] = rag_negatives_map[idx]
                 except Exception:
                     pass
+                if current_step is not None:
+                    try:
+                        record['global_step'] = int(current_step)
+                    except Exception:
+                        record['global_step'] = current_step
                 deduped_reasons = sorted({r for r in record['reason'] if r})
                 record['reason'] = deduped_reasons
                 record['failure_reasons'] = deduped_reasons
@@ -1402,16 +1969,18 @@ class CondIterAutoEncoder(nn.Module):
         success_records = []
         if self.rag_success_detail_log_path and self.rag_enabled:
             current_epoch = kwargs.get('current_epoch', None)
+            current_step = kwargs.get('global_step', None)
             for idx, has_pos in enumerate(positive_mask_cpu.tolist()):
                 if not has_pos:
                     continue
                 sample_id = sample_ids[idx]
-                dyn_frags = dyn_fragments_per_sample.get(idx, [])
+                actual_frags = actual_pos_fragments_per_sample.get(idx)
+                dyn_frags = actual_frags if actual_frags else dyn_fragments_per_sample.get(idx, [])
                 record = {
                     'type': 'molecule' if (idx < len(rag_source_list) and rag_source_list[idx]) else 'peptide',
                     'id': sample_id,
                     'rag_source_smiles': rag_source_list[idx] if idx < len(rag_source_list) else None,
-                    'dyn_fragments': dyn_frags[:10],
+                    'dyn_fragments': dyn_frags,
                     'reason': ['positive'],
                     'outcome': 'success',
                     'success': True,
@@ -1432,6 +2001,11 @@ class CondIterAutoEncoder(nn.Module):
                         record['exclude_smiles'] = skip_entry['exclude_smiles']
                 if idx < len(partition_records) and partition_records[idx] is not None:
                     record['partition'] = partition_records[idx]
+                if current_step is not None:
+                    try:
+                        record['global_step'] = int(current_step)
+                    except Exception:
+                        record['global_step'] = current_step
                 record['reason'] = sorted({r for r in record['reason'] if r})
                 record['failure_reasons'] = []
                 log_every = getattr(self, 'rag_success_log_every', 1)
@@ -1457,14 +2031,154 @@ class CondIterAutoEncoder(nn.Module):
         ligand_total = max(1, int(ligand_repr.shape[0]))
         molecule_total = max(0, rag_source_count)
         peptide_total = max(0, ligand_total - molecule_total)
+        def _safe_ratio(num, denom):
+            return float(num / denom) if denom > 0 else 0.0
+        rag_top1_acc = _safe_ratio(rag_top1_hits, rag_top1_total)
+        rag_top1_acc_molecule = _safe_ratio(rag_top1_hits_molecule, rag_top1_total_molecule)
+        rag_top1_acc_peptide = _safe_ratio(rag_top1_hits_peptide, rag_top1_total_peptide)
+        rag_top5_acc = _safe_ratio(rag_top5_hits, rag_top5_total)
+        rag_top5_acc_molecule = _safe_ratio(rag_top5_hits_molecule, rag_top5_total_molecule)
+        rag_top5_acc_peptide = _safe_ratio(rag_top5_hits_peptide, rag_top5_total_peptide)
+
+        if self.rag_batch_diag_log_path and self.rag_enabled:
+            try:
+                rag_loss_tensor = loss_dict.get('rag_contrastive_loss', torch.tensor(0.0, device=X.device, dtype=torch.float))
+                rag_loss_value = float(rag_loss_tensor.detach().cpu().item()) if isinstance(rag_loss_tensor, torch.Tensor) else float(rag_loss_tensor)
+            except Exception:
+                rag_loss_value = None
+            def _count_negatives(container):
+                total = 0
+                if isinstance(container, dict):
+                    for lists in container.values():
+                        if isinstance(lists, list):
+                            for entry in lists:
+                                if isinstance(entry, list):
+                                    total += sum(1 for item in entry if item)
+                return total
+
+            neg_external_total = 0
+            neg_inbatch_total = 0
+            if isinstance(rag_infonce_info, dict):
+                neg_external_total = _count_negatives(rag_infonce_info.get('per_anchor_external'))
+                neg_inbatch_total = _count_negatives(rag_infonce_info.get('per_anchor_inbatch'))
+
+            actual_neg_total = neg_external_total + neg_inbatch_total
+            neg_target_total = int(
+                max(0.0, float(rag_negative_count)) * max(0.0, float(rag_anchor_count))
+            )
+            actual_neg_per_anchor = (
+                float(actual_neg_total) / max(1.0, float(rag_pos_count))
+            )
+
+            diag_record = {
+                'global_step': kwargs.get('global_step', None),
+                'epoch': kwargs.get('current_epoch', None),
+                'rag_loss': rag_loss_value,
+                'rag_loss_applied': bool(rag_loss_applied),
+                'batch_size': int(batch_size),
+                'ligand_total': int(ligand_total),
+                'molecule_total': int(molecule_total),
+                'peptide_total': int(peptide_total),
+                'rag_anchor_count': float(rag_anchor_count),
+                'rag_anchor_molecule': float(rag_pos_count_molecule),
+                'rag_anchor_peptide': float(rag_pos_count_peptide),
+                'rag_negative_count': float(rag_negative_count),
+                'rag_negatives_total': int(actual_neg_total),
+                'rag_negatives_target_total': int(neg_target_total),
+                'rag_negatives_external_total': int(neg_external_total),
+                'rag_negatives_inbatch_total': int(neg_inbatch_total),
+                'rag_negatives_per_pos': int(self.rag_negatives_per_pos),
+                'rag_negatives_per_pos_actual': float(actual_neg_per_anchor),
+                'rag_cross_modal_neg_ratio': float(self.rag_cross_modal_neg_ratio),
+                'rag_dyn_pos_candidates': float(rag_dyn_pos_candidates),
+                'rag_pool_pos_candidates': float(rag_pool_pos_candidates),
+                'rag_pos_count_total': float(rag_pos_count),
+                'rag_debug_error': int(rag_debug_error),
+                'rag_positive_top1_hits': int(rag_top1_hits),
+                'rag_positive_top1_total': int(rag_top1_total),
+                'rag_positive_top1_acc': float(rag_top1_acc),
+                'rag_positive_top1_hits_molecule': int(rag_top1_hits_molecule),
+                'rag_positive_top1_total_molecule': int(rag_top1_total_molecule),
+                'rag_positive_top1_acc_molecule': float(rag_top1_acc_molecule),
+                'rag_positive_top1_hits_peptide': int(rag_top1_hits_peptide),
+                'rag_positive_top1_total_peptide': int(rag_top1_total_peptide),
+                'rag_positive_top1_acc_peptide': float(rag_top1_acc_peptide),
+                'rag_positive_top5_hits': int(rag_top5_hits),
+                'rag_positive_top5_total': int(rag_top5_total),
+                'rag_positive_top5_acc': float(rag_top5_acc),
+                'rag_positive_top5_hits_molecule': int(rag_top5_hits_molecule),
+                'rag_positive_top5_total_molecule': int(rag_top5_total_molecule),
+                'rag_positive_top5_acc_molecule': float(rag_top5_acc_molecule),
+                'rag_positive_top5_hits_peptide': int(rag_top5_hits_peptide),
+                'rag_positive_top5_total_peptide': int(rag_top5_total_peptide),
+                'rag_positive_top5_acc_peptide': float(rag_top5_acc_peptide),
+                'rag_positive_frequency': {
+                    'molecule': rag_positive_frequency.get('molecule', {}),
+                    'peptide': rag_positive_frequency.get('peptide', {}),
+                },
+                'rag_positive_fragment_frequency': {
+                    'molecule': rag_fragment_frequency.get('molecule', {}),
+                    'peptide': rag_fragment_frequency.get('peptide', {}),
+                },
+            }
+            if isinstance(rag_infonce_info, dict):
+                diag_record['per_row_loss_stats'] = rag_infonce_info.get('per_row_loss_stats')
+                diag_record['neg_usage_stats'] = rag_infonce_info.get('neg_usage_stats')
+                diag_record['rag_reason'] = rag_infonce_info.get('reason')
+            try:
+                log_dir = os.path.dirname(self.rag_batch_diag_log_path)
+                if log_dir:
+                    os.makedirs(log_dir, exist_ok=True)
+                with open(self.rag_batch_diag_log_path, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(diag_record, ensure_ascii=False) + '\n')
+            except Exception:
+                pass
+            if self.rag_fragment_freq_log_path and self.rag_enabled:
+                try:
+                    local_totals = {
+                        src: dict(payload) for src, payload in self._rag_fragment_totals.items() if payload
+                    }
+                    aggregated_totals, is_writer = self._aggregate_fragment_freq_totals(local_totals)
+                    if aggregated_totals and is_writer:
+                        freq_record = {
+                            'global_step': diag_record.get('global_step'),
+                            'epoch': diag_record.get('epoch'),
+                            'fragment_frequency_total': aggregated_totals,
+                        }
+                        freq_dir = os.path.dirname(self.rag_fragment_freq_log_path)
+                        if freq_dir:
+                            os.makedirs(freq_dir, exist_ok=True)
+                        log_every = getattr(self, 'rag_fragment_freq_log_every', 1) or 1
+                        try:
+                            log_every = max(1, int(log_every))
+                        except Exception:
+                            log_every = 1
+                        counter = getattr(self, '_rag_fragment_freq_counter', 0)
+                        should_log = (log_every == 1) or (counter % log_every == 0)
+                        if should_log:
+                            with open(self.rag_fragment_freq_log_path, 'a', encoding='utf-8') as ffreq:
+                                ffreq.write(json.dumps(freq_record, ensure_ascii=False) + '\n')
+                        self._rag_fragment_freq_counter = counter + 1
+                except Exception:
+                    pass
+
         loss_dict['rag_positive_pairs'] = torch.tensor(rag_pos_count, device=X.device, dtype=torch.float)
         loss_dict['rag_positive_ratio'] = torch.tensor(rag_pos_count / max(1, float(ligand_total)), device=X.device, dtype=torch.float)
         loss_dict['rag_positive_ratio_molecule'] = torch.tensor((rag_pos_count_molecule / molecule_total) if molecule_total > 0 else 0.0, device=X.device, dtype=torch.float)
         loss_dict['rag_positive_ratio_peptide'] = torch.tensor((rag_pos_count_peptide / peptide_total) if peptide_total > 0 else 0.0, device=X.device, dtype=torch.float)
         loss_dict['rag_zero_pos_molecules'] = torch.tensor(float(rag_zero_mol_count), device=X.device, dtype=torch.float)
         loss_dict['rag_zero_pos_peptides'] = torch.tensor(float(rag_zero_pep_count), device=X.device, dtype=torch.float)
-
-        # Retrieval module disabled: keep retrieval-specific loss at zero.
+        loss_dict['rag_batch_ligand_total'] = torch.tensor(float(ligand_total), device=X.device, dtype=torch.float)
+        loss_dict['rag_positive_top1_hits'] = torch.tensor(float(rag_top1_hits), device=X.device, dtype=torch.float)
+        loss_dict['rag_positive_top1_total'] = torch.tensor(float(rag_top1_total), device=X.device, dtype=torch.float)
+        loss_dict['rag_positive_top1_acc'] = torch.tensor(float(rag_top1_acc), device=X.device, dtype=torch.float)
+        loss_dict['rag_positive_top1_acc_molecule'] = torch.tensor(float(rag_top1_acc_molecule), device=X.device, dtype=torch.float)
+        loss_dict['rag_positive_top1_acc_peptide'] = torch.tensor(float(rag_top1_acc_peptide), device=X.device, dtype=torch.float)
+        loss_dict['rag_positive_top5_hits'] = torch.tensor(float(rag_top5_hits), device=X.device, dtype=torch.float)
+        loss_dict['rag_positive_top5_total'] = torch.tensor(float(rag_top5_total), device=X.device, dtype=torch.float)
+        loss_dict['rag_positive_top5_acc'] = torch.tensor(float(rag_top5_acc), device=X.device, dtype=torch.float)
+        loss_dict['rag_positive_top5_acc_molecule'] = torch.tensor(float(rag_top5_acc_molecule), device=X.device, dtype=torch.float)
+        loss_dict['rag_positive_top5_acc_peptide'] = torch.tensor(float(rag_top5_acc_peptide), device=X.device, dtype=torch.float)
 
         total = 0
         for name in self.loss_weights:

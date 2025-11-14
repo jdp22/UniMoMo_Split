@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import traceback
 from tqdm import tqdm
 from copy import deepcopy
 from typing import List
@@ -195,7 +196,14 @@ def main(args, opt_args):
     n_samples = config.get('n_samples', 1)
     n_cycles = config.get('n_cycles', 0)
 
-    recorder = Recorder(test_set, n_samples, save_dir)
+    max_failures = config.get('max_failures_per_sample', 1)
+    try:
+        max_failures = int(max_failures)
+    except Exception:
+        max_failures = 1
+    if max_failures < 1:
+        max_failures = 1
+    recorder = Recorder(test_set, n_samples, save_dir, max_failures_per_item=max_failures)
     
     batch_size = config['dataloader']['batch_size']
 
@@ -242,10 +250,15 @@ def main(args, opt_args):
                 complex_to_pdb(cplx, os.path.join(tmp_cand_save_dir, summary.id, 'pocket.pdb'), summary.target_chain_ids)
             if n_cycles == 0: save_path = os.path.join(cand_save_dir, summary.id, f'{n}.pdb')
             else: save_path = os.path.join(tmp_cand_save_dir, summary.id, f'{n}.pdb')
-            log = overwrite(
-                cplx, summary, S, X, A, ll, bonds, intra_bonds, save_path,
-                check_validity=False, fragment_smiles=fragment_smiles, ground_truth_fragments=ground_truth_fragments
-            )
+            try:
+                log = overwrite(
+                    cplx, summary, S, X, A, ll, bonds, intra_bonds, save_path,
+                    check_validity=False, fragment_smiles=fragment_smiles, ground_truth_fragments=ground_truth_fragments
+                )
+            except Exception as exc:
+                print_log(f'Failed to assemble sample {summary.id}: {exc}', level='WARNING')
+                print_log(traceback.format_exc(), level='DEBUG')
+                log = None
             stats = getattr(model, 'last_retrieval_stats', None)
             if stats:
                 total_blocks += stats.get('evaluated_blocks', 0)
@@ -309,11 +322,16 @@ def main(args, opt_args):
                 if hasattr(test_set, 'get_expected_atom_num'):
                     expect_atom_num = test_set.get_expected_atom_num(item_idx)
                 else: expect_atom_num = None
-                log = overwrite(
-                    cplx, summary, S, X, A, ll, bonds, intra_bonds, save_path,
-                    check_validity=final_cycle, expect_atom_num=expect_atom_num,
-                    fragment_smiles=fragment_smiles, ground_truth_fragments=ground_truth_fragments
-                )
+                try:
+                    log = overwrite(
+                        cplx, summary, S, X, A, ll, bonds, intra_bonds, save_path,
+                        check_validity=final_cycle, expect_atom_num=expect_atom_num,
+                        fragment_smiles=fragment_smiles, ground_truth_fragments=ground_truth_fragments
+                    )
+                except Exception as exc:
+                    print_log(f'Failed to assemble sample {summary.id}: {exc}', level='WARNING')
+                    print_log(traceback.format_exc(), level='DEBUG')
+                    log = None
                 stats = getattr(model_autoencoder, 'last_retrieval_stats', None)
                 if stats:
                     total_blocks += stats.get('evaluated_blocks', 0)

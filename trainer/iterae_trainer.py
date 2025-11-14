@@ -19,9 +19,11 @@ class IterAETrainer(Trainer): # autoregressive autoencoder trainer
         if self.config.warmup != 0:
             batch['warmup_progress'] = min(self.global_step / self.config.warmup, 1.0)
             self.log('warmup_progress', batch['warmup_progress'], batch_idx, val=False)
+        batch['global_step'] = self.global_step
         return self.share_step(batch, batch_idx)
 
     def valid_step(self, batch, batch_idx):
+        batch['global_step'] = self.global_step
         loss = self.share_step(batch, batch_idx, val=True)
 
         if self.local_rank != -1: # DDP mode

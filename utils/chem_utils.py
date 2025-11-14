@@ -466,7 +466,10 @@ def cycle_check(mol, idx1, idx2, bond_type):
     '''
         Check cycle constraints if we connect atom 1 to atom 2
     '''
-    Chem.SanitizeMol(mol)
+    try:
+        Chem.SanitizeMol(mol)
+    except Exception:
+        return False
     new_cycle_len, path = shortest_path_len(mol, idx1, idx2)
 
     # single ring check

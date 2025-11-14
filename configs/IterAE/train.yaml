@@ -3,26 +3,21 @@ dataset:
     # Peptides
     - class: DynamicBatchWrapper
       dataset:
-        class: ResidueFragmentWrapper
-        dataset:
-          class: MixDatasetWrapper
-          datasets:
-            # pepbench
-            - class: PeptideDataset
-              mmap_dir: ./datasets/peptide/pepbench/processed
-              specify_index: ./datasets/peptide/pepbench/processed/train_index.txt
-              cluster: ./datasets/peptide/pepbench/train.cluster
-            # protein-peptide complex with non standard amino acids
-            - class: PeptideDataset
-              mmap_dir: ./datasets/peptide/pepbench/processed
-              specify_index: ./datasets/peptide/pepbench/processed/non_standard_index.txt
-            # protein-fragments
-            - class: PeptideDataset
-              mmap_dir: ./datasets/peptide/ProtFrag/processed
-          # weights: [1.0, 1.0, 1.0]
-        storage_path: ./datasets/peptide/subgraphs_residue.train.jsonl
-        storage_min_heavy_atoms: 1
-        storage_metadata: true
+        class: MixDatasetWrapper
+        datasets:
+          # pepbench
+          - class: PeptideDataset
+            mmap_dir: ./datasets/peptide/pepbench/processed
+            specify_index: ./datasets/peptide/pepbench/processed/train_index.txt
+            cluster: ./datasets/peptide/pepbench/train.cluster
+          # protein-peptide complex with non standard amino acids
+          - class: PeptideDataset
+            mmap_dir: ./datasets/peptide/pepbench/processed
+            specify_index: ./datasets/peptide/pepbench/processed/non_standard_index.txt
+          # protein-fragments
+          - class: PeptideDataset
+            mmap_dir: ./datasets/peptide/ProtFrag/processed
+        # weights: [1.0, 1.0, 1.0]
       complexity: n*n
       ubound_per_batch: 12000000
       n_use_max_in_batch: true
@@ -35,17 +30,24 @@ dataset:
       complexity: n*n
       ubound_per_batch: 12000000
       n_use_max_in_batch: true
+    # Antibody
+    - class: DynamicBatchWrapper
+      dataset:
+        class: MixDatasetWrapper
+        datasets:
+          - class: AntibodyDataset
+            mmap_dir: ./datasets/antibody/SAbDab/processed
+            specify_index: ./datasets/antibody/SAbDab/processed/train_index.txt
+        weights: [1.0]
+      complexity: n*n
+      ubound_per_batch: 12000000
+      n_use_max_in_batch: true
   valid:
     - class: DynamicBatchWrapper
       dataset: 
-        class: ResidueFragmentWrapper
-        dataset:
-          class: PeptideDataset
-          mmap_dir: ./datasets/peptide/pepbench/processed
-          specify_index: ./datasets/peptide/pepbench/processed/valid_index.txt
-        storage_path: ./datasets/peptide/subgraphs_residue.valid.jsonl
-        storage_min_heavy_atoms: 1
-        storage_metadata: true
+        class: PeptideDataset
+        mmap_dir: ./datasets/peptide/pepbench/processed
+        specify_index: ./datasets/peptide/pepbench/processed/valid_index.txt
       complexity: n*n
       ubound_per_batch: 12000000
       n_use_max_in_batch: true
@@ -54,6 +56,14 @@ dataset:
         class: MoleculeDataset
         mmap_dir: ./datasets/molecule/CrossDocked/processed
         specify_index: ./datasets/molecule/CrossDocked/processed/valid_index.txt
+      complexity: n*n
+      ubound_per_batch: 12000000
+      n_use_max_in_batch: true
+    - class: DynamicBatchWrapper
+      dataset: 
+        class: AntibodyDataset
+        mmap_dir: ./datasets/antibody/SAbDab/processed
+        specify_index: ./datasets/antibody/SAbDab/processed/valid_index.txt
       complexity: n*n
       ubound_per_batch: 12000000
       n_use_max_in_batch: true

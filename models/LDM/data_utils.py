@@ -3,7 +3,7 @@
 import os
 import json
 from copy import deepcopy
-from typing import List
+from typing import List, Optional
 from dataclasses import dataclass
 
 import torch
@@ -42,8 +42,13 @@ class OverwriteTask:
     intra_bonds: list
     # output
     out_path: str
+    fragment_smiles: Optional[List[Optional[str]]] = None
 
     def get_generated_seq(self):
+        if self.fragment_smiles is not None:
+            if isinstance(self.fragment_smiles, (list, tuple)):
+                return [frag for frag in self.fragment_smiles]
+            return self.fragment_smiles
         gen_seq = ''.join([VOCAB.idx_to_symbol(block_S) for block_S in self.S])
         return gen_seq
 
@@ -231,11 +236,14 @@ def _get_item(pdb_path, sdf_path, tgt_chains):
 
 
 class Recorder:
-    def __init__(self, test_set, n_samples, save_dir):
+    def __init__(self, test_set, n_samples, save_dir, max_failures_per_item: int = 1):
+        self.dataset = test_set
         self.pbar = tqdm(total=n_samples * len(test_set))
         self.waiting_list = [(i, n) for n in range(n_samples) for i in range(len(test_set))]
         self.num_generated, self.num_failed = 0, 0
         self.fout = open(os.path.join(save_dir, 'results.jsonl'), 'w')
+        self.max_failures_per_item = max(1, int(max_failures_per_item))
+        self.fail_counts = {}
 
     def is_finished(self):
         return len(self.waiting_list) == 0
@@ -249,15 +257,30 @@ class Recorder:
         self.num_generated += 1
         if log is None:
             self.num_failed += 1
-            self.waiting_list.append((item_idx, n))
-        else:
-            log.update({
-                'n': n,
-                'struct_only': struct_only
-            })
-            self.fout.write(json.dumps(log) + '\n')
-            self.fout.flush()
-            self.pbar.update(1)
+            key = (item_idx, n)
+            count = self.fail_counts.get(key, 0) + 1
+            self.fail_counts[key] = count
+            if count < self.max_failures_per_item:
+                self.waiting_list.append((item_idx, n))
+            else:
+                summary_id = None
+                if hasattr(self.dataset, 'get_summary'):
+                    try:
+                        summary = self.dataset.get_summary(item_idx)
+                        summary_id = getattr(summary, 'id', None)
+                    except Exception:
+                        summary_id = None
+                msg_id = summary_id if summary_id is not None else f'idx={item_idx}'
+                print_log(f'Skipping sample {msg_id} (n={n}) after {count} failed attempts', level='WARNING')
+                self.pbar.update(1)
+            return
+        log.update({
+            'n': n,
+            'struct_only': struct_only
+        })
+        self.fout.write(json.dumps(log) + '\n')
+        self.fout.flush()
+        self.pbar.update(1)
 
     def __del__(self):
         self.fout.close()

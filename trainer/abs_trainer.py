@@ -138,16 +138,30 @@ class Trainer:
             if not backward_ok:
                 print_log(f'Backward out of memory, skip', level='WARN')
                 loss = loss.detach() # manually delete the computing graph
+            grad_norm_pre = None
+            grad_norm_post = None
             if self.config.grad_clip is not None:
-                ori_grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
-            else:
-                ori_grad_norm = 0
+                pre_clip_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+                grad_norm_pre = float(pre_clip_norm.detach().cpu().item()) if isinstance(pre_clip_norm, torch.Tensor) else float(pre_clip_norm)
+                total_sq = 0.0
                 for p in self.model.parameters():
                     if p.grad is not None and p.requires_grad:
-                        ori_grad_norm += p.grad.detach().data.norm(2) ** 2
-                ori_grad_norm = ori_grad_norm ** 0.5
-            # recording gradients
-            self.log('Grad Norm', ori_grad_norm.cpu(), self.global_step)
+                        val = p.grad.detach().data.norm(2)
+                        total_sq += float(val.item() ** 2)
+                grad_norm_post = (total_sq ** 0.5) if total_sq > 0 else 0.0
+            else:
+                total_sq = 0.0
+                for p in self.model.parameters():
+                    if p.grad is not None and p.requires_grad:
+                        val = p.grad.detach().data.norm(2)
+                        total_sq += float(val.item() ** 2)
+                grad_norm_pre = (total_sq ** 0.5) if total_sq > 0 else 0.0
+            # recording gradients (retain legacy key for pre-clip norm)
+            if grad_norm_pre is not None:
+                self.log('Grad Norm', grad_norm_pre, self.global_step)
+                self.log('Grad Norm/PreClip', grad_norm_pre, self.global_step)
+            if grad_norm_post is not None:
+                self.log('Grad Norm/Clipped', grad_norm_post, self.global_step)
             self.optimizer.step()
             if hasattr(t_iter, 'set_postfix'):
                 postfix = {'loss': f'{loss.item():.4g}', 'ver': self.version}

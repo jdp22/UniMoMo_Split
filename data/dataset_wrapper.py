@@ -1,7 +1,8 @@
 import json
 import os
 import random
-from typing import Callable, Optional, Sequence, List
+import math
+from typing import Callable, Optional, Sequence, List, Tuple, Dict
 from collections import deque
 from tqdm import tqdm
 
@@ -26,6 +27,10 @@ from scripts.chem.partition_demo import (
     fragment_smiles_for_partitions,
 )
 from utils.subgraph_storage import _heavy_atom_count, SubgraphStorage
+from utils.logger import print_log
+
+ABRV_TO_AA_SYMBOL: Dict[str, str] = {abrv: symbol for symbol, abrv in aas}
+PEPTIDE_SEQUENCE_KEY = 'sequence'
 
 
 class _DynamicFragmentSampler:
@@ -277,6 +282,20 @@ class MixDatasetWrapper(torch.utils.data.Dataset):
         idx = self.dynamic_idx[idx]
         dataset, idx = self._get_dataset_and_idx(idx)
         return dataset.get_len(idx)
+
+    def get_id(self, idx):
+        idx = self.dynamic_idx[idx]
+        dataset, idx = self._get_dataset_and_idx(idx)
+        if hasattr(dataset, 'get_id'):
+            return dataset.get_id(idx)
+        raise AttributeError('MixDatasetWrapper underlying dataset lacks get_id')
+
+    def get_summary(self, idx):
+        idx = self.dynamic_idx[idx]
+        dataset, idx = self._get_dataset_and_idx(idx)
+        if hasattr(dataset, 'get_summary'):
+            return dataset.get_summary(idx)
+        return None
 
     def __len__(self):
         return len(self.dynamic_idx)
@@ -715,6 +734,9 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
             allow_single_fragment_fallback: bool = False,
             fallback_max_heavy_atoms: Optional[int] = None,
             partition_seeds: Optional[Sequence[int]] = None,
+            peptide_smiles_map: Optional[str] = None,
+            peptide_smiles_prob: float = 0.9,
+            peptide_num_part_ratios: Optional[Sequence[float]] = None,
         ) -> None:
         super().__init__()
         self.dataset = R.recur_construct(dataset)
@@ -763,6 +785,24 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
         self._active_indices: List[int] = list(range(len(self.dataset)))
         self.allow_single_fragment_fallback = allow_single_fragment_fallback
         self._fallback_max_heavy_atoms = None if fallback_max_heavy_atoms is None else max(0, int(fallback_max_heavy_atoms))
+        self.peptide_smiles_map: Optional[Dict[Tuple[str, Optional[str]], str]] = None
+        self.peptide_smiles_prob = max(0.0, min(1.0, float(peptide_smiles_prob)))
+        self._peptide_part_ratios: Optional[Tuple[float, ...]] = None
+        if peptide_num_part_ratios is not None:
+            ratios: List[float] = []
+            for value in peptide_num_part_ratios:
+                try:
+                    ratio = float(value)
+                except Exception:
+                    continue
+                if ratio <= 0:
+                    continue
+                ratios.append(ratio)
+            if ratios:
+                unique = sorted({float(r) for r in ratios}, reverse=True)
+                self._peptide_part_ratios = tuple(unique)
+        if peptide_smiles_map:
+            self._load_peptide_smiles_map(peptide_smiles_map)
 
     def _max_trials(self) -> int:
         return len(self._partition_seeds) if self._partition_seeds else max(1, self.max_attempts)
@@ -817,6 +857,117 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
         if not self._partition_seeds:
             return self.random.randint(0, 2**32 - 1)
         return self._partition_seeds[attempt_idx % len(self._partition_seeds)]
+
+    def _load_peptide_smiles_map(self, path: str) -> None:
+        mapping: Dict[Tuple[str, Optional[str]], str] = {}
+        file_path = os.path.abspath(path)
+        try:
+            with open(file_path, 'r', encoding='utf-8') as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except Exception:
+                        continue
+                    mol_id = record.get('id')
+                    chain_id = record.get('chain_id')
+                    smiles = record.get('smiles')
+                    sequence = record.get('sequence')
+                    if not isinstance(smiles, str) or not smiles:
+                        continue
+                    if mol_id:
+                        key = (str(mol_id), chain_id if chain_id else None)
+                        mapping[key] = smiles
+                    if isinstance(sequence, str) and sequence:
+                        mapping[(PEPTIDE_SEQUENCE_KEY, sequence)] = smiles
+            if mapping:
+                self.peptide_smiles_map = mapping
+                print_log(f'[DynamicBlockWrapper] Loaded {len(mapping)} peptide SMILES entries from {file_path}', level='INFO')
+            else:
+                self.peptide_smiles_map = None
+                print_log(f'[DynamicBlockWrapper] peptide SMILES map empty at {file_path}', level='WARN')
+        except Exception as exc:
+            self.peptide_smiles_map = None
+            print_log(f'[DynamicBlockWrapper] Failed to load peptide SMILES map from {file_path}: {exc}', level='WARN')
+
+    @staticmethod
+    def _aa_smiles_for_block_type(block_type_idx: int) -> Optional[str]:
+        try:
+            abrv = VOCAB.idx_to_abrv(int(block_type_idx))
+        except Exception:
+            return None
+        symbol = ABRV_TO_AA_SYMBOL.get(abrv)
+        if symbol is None:
+            return None
+        return aa_smiles.get(symbol)
+
+    def _peptide_sequence_partitions(
+            self,
+            ligand_block_indices: torch.Tensor,
+            block_offsets: torch.Tensor,
+            ligand_atom_indices: torch.Tensor,
+            block_types: torch.Tensor
+        ) -> Tuple[List[List[int]], List[Optional[str]]]:
+        if ligand_block_indices.numel() == 0:
+            return [], []
+        ligand_atom_indices_list = ligand_atom_indices.tolist()
+        local_map = {idx: local for local, idx in enumerate(ligand_atom_indices_list)}
+        partitions: List[List[int]] = []
+        frag_smiles: List[Optional[str]] = []
+        seen_keys: set[Tuple[int, ...]] = set()
+        block_offsets_cpu = block_offsets.cpu()
+        for block_pos, blk in enumerate(ligand_block_indices.tolist()):
+            atom_indices = torch.nonzero(block_offsets_cpu == blk, as_tuple=False).view(-1)
+            if atom_indices.numel() == 0:
+                continue
+            local_indices = [
+                local_map.get(int(atom_idx.item()))
+                for atom_idx in atom_indices
+                if int(atom_idx.item()) in local_map
+            ]
+            local_indices = [idx for idx in local_indices if idx is not None]
+            if not local_indices:
+                continue
+            part = tuple(sorted(set(local_indices)))
+            if not part or part in seen_keys:
+                continue
+            seen_keys.add(part)
+            partitions.append(list(part))
+            block_type_val = block_types[blk].item() if blk < block_types.numel() else None
+            smiles = self._aa_smiles_for_block_type(block_type_val) if block_type_val is not None else None
+            frag_smiles.append(smiles)
+        return partitions, frag_smiles
+
+    def _select_peptide_smiles(self, summary, sequence: Optional[str]) -> Tuple[Optional[str], str]:
+        if self.peptide_smiles_map is None or summary is None:
+            return None, 'sequence'
+        summary_id = getattr(summary, 'id', None)
+        ligand_ids = getattr(summary, 'ligand_chain_ids', None) or []
+        ligand_sequences = getattr(summary, 'ligand_sequences', None) or []
+        mapped_smiles = None
+        if summary_id is not None:
+            for chain_id in ligand_ids:
+                key = (str(summary_id), chain_id if chain_id else None)
+                mapped_smiles = self.peptide_smiles_map.get(key)
+                if mapped_smiles:
+                    break
+            if mapped_smiles is None:
+                mapped_smiles = self.peptide_smiles_map.get((str(summary_id), None))
+        if mapped_smiles is None and ligand_sequences:
+            for seq in ligand_sequences:
+                mapped_smiles = self.peptide_smiles_map.get((PEPTIDE_SEQUENCE_KEY, seq))
+                if mapped_smiles:
+                    break
+        if mapped_smiles is None and sequence:
+            mapped_smiles = self.peptide_smiles_map.get((PEPTIDE_SEQUENCE_KEY, sequence))
+        if mapped_smiles is None:
+            return None, 'sequence'
+        rand_val = self.random.random()
+        if rand_val < self.peptide_smiles_prob:
+            return mapped_smiles, 'smiles'
+        return None, 'sequence'
+
 
     def _log_partitions(
             self,
@@ -953,89 +1104,160 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
         ligand_atom_indices = torch.nonzero(ligand_mask, as_tuple=False).view(-1)
 
         partitions: Optional[List[List[int]]] = None
+        frag_smiles_list: Optional[List[Optional[str]]] = None
         ligand_contains_aa = bool(is_aa[ligand_block_indices].any().item()) if ligand_block_indices.numel() else False
         sample_type = 'peptide' if ligand_contains_aa else 'molecule'
-        ligand_smiles = getattr(summary, 'ref_seq', None) if summary is not None else None
+        ligand_sequence = getattr(summary, 'ref_seq', None) if summary is not None else None
+        peptide_partition_mode = 'smiles'
+        sequence_fallback_used = False
+        reconstructed_sequence_smiles: Optional[str] = None
+        if sample_type == 'peptide':
+            ligand_smiles, peptide_partition_mode = self._select_peptide_smiles(summary, ligand_sequence)
+        else:
+            ligand_smiles = ligand_sequence
         num_ligand_atoms = int(ligand_atom_indices.numel())
-        frag_smiles_list: Optional[List[str]] = None
         mol = None
-        if ligand_smiles and num_ligand_atoms > 0:
+        original_partitions: Optional[List[List[int]]] = None
+        original_smiles: Optional[List[Optional[str]]] = None
+        if ligand_smiles and num_ligand_atoms > 0 and peptide_partition_mode == 'smiles':
+            try:
+                mol = Chem.MolFromSmiles(ligand_smiles)
+            except Exception:
+                mol = None
+        elif sample_type != 'peptide' and ligand_smiles and num_ligand_atoms > 0:
             try:
                 mol = Chem.MolFromSmiles(ligand_smiles)
             except Exception:
                 mol = None
         if mol is not None and num_ligand_atoms > 0:
-            candidate_parts: List[int]
             min_fragment_atoms = self._min_fragment_atoms()
             total_atoms = mol.GetNumAtoms()
+
+            ratio_candidates: List[int] = []
+            if sample_type == 'peptide' and self._peptide_part_ratios and ligand_block_indices.numel() > 0:
+                block_count = int(ligand_block_indices.numel())
+                for ratio in self._peptide_part_ratios:
+                    candidate = int(math.ceil(block_count * ratio))
+                    if candidate > 0:
+                        ratio_candidates.append(candidate)
+
+            base_candidates: List[int]
             if isinstance(self.num_parts, int):
-                candidate_parts = [self.num_parts]
+                base_candidates = [self.num_parts]
             elif isinstance(self.num_parts, (list, tuple)):
-                candidate_parts = sorted({int(max(1, p)) for p in self.num_parts if isinstance(p, (int, float))}, reverse=True)
+                base_candidates = sorted({int(max(1, p)) for p in self.num_parts if isinstance(p, (int, float))}, reverse=True)
             else:
-                candidate_parts = [2]
-            if 2 not in candidate_parts:
-                candidate_parts.append(2)
-            candidate_parts = [min(int(p), num_ligand_atoms) for p in candidate_parts if int(p) > 0]
-            candidate_parts = [p for p in candidate_parts if p >= 2]
-            if min_fragment_atoms > 0:
-                candidate_parts = [
-                    p for p in candidate_parts
-                    if total_atoms >= p * min_fragment_atoms
-                ]
-            if not candidate_parts:
-                candidate_parts = [2] if total_atoms >= 2 else []
+                base_candidates = [2]
+            if 2 not in base_candidates:
+                base_candidates.append(2)
+
+            use_base_candidates = not (sample_type == 'peptide' and self._peptide_part_ratios)
+
+            candidate_parts: List[int] = []
+            sources: List[Sequence[int]] = []
+            if ratio_candidates:
+                sources.append(ratio_candidates)
+            if use_base_candidates:
+                sources.append(base_candidates)
+
+            for source in sources:
+                for value in source:
+                    try:
+                        candidate = int(value)
+                    except Exception:
+                        continue
+                    if candidate <= 0:
+                        continue
+                    candidate = min(candidate, num_ligand_atoms)
+                    if candidate < 2:
+                        continue
+                    if min_fragment_atoms > 0 and total_atoms < candidate * min_fragment_atoms:
+                        continue
+                    if candidate not in candidate_parts:
+                        candidate_parts.append(candidate)
+            if not candidate_parts and total_atoms >= 2 and use_base_candidates:
+                candidate_parts = [min(2, num_ligand_atoms)]
+
+            selected_partitions: Optional[List[List[int]]] = None
+            selected_frag_smiles: Optional[List[Optional[str]]] = None
+            original_partitions: Optional[List[List[int]]] = None
+            original_smiles: Optional[List[Optional[str]]] = None
             max_trials = self._max_trials()
             for candidate_idx, requested in enumerate(candidate_parts):
-                if requested <= 0:
-                    continue
-                for trial in range(max_trials):
-                    seed = self._partition_seed(candidate_idx * max_trials + trial)
-                    try:
-                        partitions = random_subgraph_partition(mol, num_partitions=requested, seed=seed)
-                    except ValueError:
-                        partitions = None
-                    if partitions and len(partitions) > 1:
+                success = False
+                for threshold_idx, threshold in enumerate(self.min_heavy_atom_thresholds):
+                    threshold_value = max(0, int(threshold))
+                    for trial in range(max_trials):
+                        seed_index = ((candidate_idx * len(self.min_heavy_atom_thresholds) + threshold_idx) * max_trials) + trial
+                        seed = self._partition_seed(seed_index)
                         try:
-                            frag_smiles_list = fragment_smiles_for_partitions(mol, partitions)
+                            partitions = random_subgraph_partition(mol, num_partitions=requested, seed=seed)
+                        except ValueError:
+                            partitions = None
+                        if not partitions or len(partitions) <= 1:
+                            continue
+                        if threshold_value > 0 and any(len(part) < threshold_value for part in partitions):
+                            continue
+                        try:
+                            frag_smiles = fragment_smiles_for_partitions(mol, partitions)
                         except Exception:
-                            frag_smiles_list = None
-                        if frag_smiles_list and len(frag_smiles_list) == len(partitions):
-                            break
-                        partitions = None
-                        frag_smiles_list = None
-        if mol is not None and num_ligand_atoms > 0:
-            if not partitions or len(partitions) <= 1 or not frag_smiles_list or len(frag_smiles_list) < len(partitions):
+                            frag_smiles = None
+                        if not frag_smiles or len(frag_smiles) != len(partitions):
+                            continue
+                        selected_partitions = partitions
+                        selected_frag_smiles = frag_smiles
+                        original_partitions = [list(part) for part in partitions]
+                        original_smiles = list(frag_smiles)
+                        success = True
+                        break
+                    if success:
+                        break
+                if selected_partitions is not None:
+                    break
+
+            if selected_partitions is not None:
+                partitions = selected_partitions
+                frag_smiles_list = selected_frag_smiles
+            elif sample_type == 'peptide' and peptide_partition_mode == 'smiles':
+                peptide_partition_mode = 'smiles_fallback'
+        else:
+            if sample_type == 'peptide' and peptide_partition_mode == 'smiles':
+                peptide_partition_mode = 'smiles_fallback'
+
+        if partitions is None:
+            if sample_type == 'peptide' and peptide_partition_mode in ('sequence', 'smiles_fallback'):
+                partitions, frag_smiles_list = self._peptide_sequence_partitions(
+                    ligand_block_indices,
+                    block_offsets,
+                    ligand_atom_indices,
+                    block_types
+                )
+                if frag_smiles_list:
+                    fragment_strings = [frag for frag in frag_smiles_list if isinstance(frag, str) and frag]
+                    if fragment_strings:
+                        reconstructed_sequence_smiles = '.'.join(fragment_strings)
+                        ligand_smiles = reconstructed_sequence_smiles
+                mol = None
+                peptide_partition_mode = 'sequence'
+                sequence_fallback_used = True
+            else:
                 fallback = self._fallback_partitions_from_blocks(
                     ligand_block_indices,
                     block_offsets,
                     ligand_atom_indices
                 )
-                if fallback and len(fallback) > 1:
+                if fallback:
                     partitions = fallback
-                    try:
-                        frag_smiles_list = fragment_smiles_for_partitions(mol, partitions)
-                    except Exception:
-                        frag_smiles_list = None
-        if mol is not None and num_ligand_atoms > 0:
-            if (not partitions or len(partitions) <= 1) and num_ligand_atoms > 1:
-                for trial in range(max_trials):
-                    seed = self._partition_seed(trial)
-                    connected = self._connected_partition(mol, min(2, num_ligand_atoms), seed)
-                    if not connected or len(connected) <= 1:
-                        continue
-                    try:
-                        frag_smiles_list = fragment_smiles_for_partitions(mol, connected)
-                    except Exception:
-                        frag_smiles_list = None
-                    if frag_smiles_list and len(frag_smiles_list) == len(connected):
-                        partitions = connected
-                        break
-                if partitions is not None and len(partitions) > 1 and (not frag_smiles_list or len(frag_smiles_list) != len(partitions)):
-                    try:
-                        frag_smiles_list = fragment_smiles_for_partitions(mol, partitions)
-                    except Exception:
-                        frag_smiles_list = None
+                    if mol is not None:
+                        try:
+                            frag_smiles_list = fragment_smiles_for_partitions(mol, partitions)
+                        except Exception:
+                            frag_smiles_list = None
+        if mol is not None and num_ligand_atoms > 0 and partitions is not None and frag_smiles_list is None:
+            try:
+                frag_smiles_list = fragment_smiles_for_partitions(mol, partitions)
+            except Exception:
+                frag_smiles_list = None
         if not partitions:
             fallback_blocks = self._fallback_partitions_from_blocks(
                 ligand_block_indices,
@@ -1047,41 +1269,23 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
             else:
                 partitions = [list(range(num_ligand_atoms))]
             frag_smiles_list = None
-
-        if partitions:
-            original_partitions = list(partitions)
-            base_smiles = frag_smiles_list if frag_smiles_list is not None else [None] * len(partitions)
-            original_smiles = list(base_smiles)
-            for threshold in self.min_heavy_atom_thresholds:
-                if threshold <= 0:
-                    filtered_partitions = original_partitions
-                    filtered_smiles = original_smiles
-                else:
-                    filtered_partitions = []
-                    filtered_smiles = []
-                    for part, smi in zip(original_partitions, original_smiles):
-                        if len(part) >= threshold:
-                            filtered_partitions.append(part)
-                            filtered_smiles.append(smi)
-                if filtered_partitions:
-                    partitions = filtered_partitions
-                    frag_smiles_list = filtered_smiles
-                    break
-            else:
-                partitions = original_partitions
-                frag_smiles_list = original_smiles
+        if partitions and original_partitions is None:
+            original_partitions = [list(part) for part in partitions]
+        if partitions and original_smiles is None:
+            original_smiles = list(frag_smiles_list) if frag_smiles_list is not None else [None] * len(partitions)
 
         if mol is not None and partitions:
-            partitions, frag_smiles_list = self._ensure_partition_quality(
-                mol,
-                partitions,
-                list(frag_smiles_list) if frag_smiles_list is not None else None,
-                ligand_block_indices,
-                block_offsets,
-                ligand_atom_indices,
-            )
+            if sample_type != 'peptide':
+                partitions, frag_smiles_list = self._ensure_partition_quality(
+                    mol,
+                    partitions,
+                    list(frag_smiles_list) if frag_smiles_list is not None else None,
+                    ligand_block_indices,
+                    block_offsets,
+                    ligand_atom_indices,
+                )
 
-        if mol is not None and 'original_partitions' in locals():
+        if mol is not None and original_partitions is not None and original_smiles is not None:
             self._log_partitions(
                 mol,
                 original_partitions,
@@ -1092,7 +1296,7 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
                 sample_type,
             )
 
-        if self.storage is not None and ligand_smiles and partitions:
+        if self.storage is not None and ligand_smiles and partitions and not sequence_fallback_used:
             try:
                 metadata = {'id': getattr(summary, 'id', None)} if self.storage_metadata and summary is not None else None
                 self.storage.store_partitions(ligand_smiles, partitions, metadata=metadata)
@@ -1102,12 +1306,23 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
         ligand_atom_indices_list = ligand_atom_indices.tolist()
         rdkit_index_map = {global_idx: rdkit_idx for rdkit_idx, global_idx in enumerate(ligand_atom_indices_list)}
         mapped_partitions: List[List[int]] = []
-        for part in partitions:
-            mapped = [ligand_atom_indices_list[idx] for idx in part if idx < len(ligand_atom_indices_list)]
-            if mapped:
-                mapped_partitions.append(sorted(mapped))
+        mapped_fragment_smiles: List[Optional[str]] = []
+        total_atoms = len(ligand_atom_indices_list)
+        for idx, part in enumerate(partitions):
+            mapped = [ligand_atom_indices_list[local_idx] for local_idx in part if 0 <= local_idx < total_atoms]
+            if not mapped:
+                continue
+            mapped_partitions.append(sorted(mapped))
+            if frag_smiles_list is not None and idx < len(frag_smiles_list):
+                mapped_fragment_smiles.append(frag_smiles_list[idx])
+            else:
+                mapped_fragment_smiles.append(None)
         if not mapped_partitions:
             mapped_partitions = [ligand_atom_indices_list]
+            if frag_smiles_list and len(frag_smiles_list) > 0:
+                mapped_fragment_smiles = [frag_smiles_list[0]]
+            else:
+                mapped_fragment_smiles = [None]
 
         dyn_block_lengths: List[int] = []
         dyn_block_types: List[int] = []
@@ -1129,9 +1344,10 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
             dyn_is_aa.append(bool(is_aa[orig_idx].item()))
 
         current_idx = len(dyn_block_lengths)
+        is_peptide_sample = (sample_type == 'peptide')
         dyn_fragment_smiles: List[Optional[str]] = [None] * current_idx
         ligand_chain_id = int(chain_ids[ligand_block_indices[0]].item()) if ligand_block_indices.numel() else 0
-        for part_idx, partition in enumerate(mapped_partitions):
+        for partition, frag_smiles in zip(mapped_partitions, mapped_fragment_smiles):
             if not partition:
                 continue
             for atom_idx in partition:
@@ -1141,11 +1357,8 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
             dyn_generate_mask.append(True)
             dyn_chain_ids.append(ligand_chain_id)
             dyn_position_ids.append(0)
-            dyn_is_aa.append(False)
-            if frag_smiles_list is not None and part_idx < len(frag_smiles_list):
-                dyn_fragment_smiles.append(frag_smiles_list[part_idx])
-            else:
-                dyn_fragment_smiles.append(None)
+            dyn_is_aa.append(is_peptide_sample)
+            dyn_fragment_smiles.append(frag_smiles)
             current_idx += 1
 
         remaining_atoms = torch.nonzero(dyn_block_ids < 0, as_tuple=False).view(-1)
@@ -1156,7 +1369,7 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
             dyn_generate_mask.append(True)
             dyn_chain_ids.append(ligand_chain_id)
             dyn_position_ids.append(0)
-            dyn_is_aa.append(False)
+            dyn_is_aa.append(is_peptide_sample)
             single_smiles = None
             if mol is not None:
                 rdkit_idx = rdkit_index_map.get(atom_idx)
@@ -1184,6 +1397,8 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
             'dyn_fragment_smiles': dyn_fragment_smiles,
             'dyn_num_blocks': torch.tensor([len(dyn_block_lengths)], dtype=torch.long),
         }
+        if sample_type == 'peptide':
+            dyn['peptide_dynamic_mode'] = peptide_partition_mode
         return dyn
 
     def collate_fn(self, batch):
@@ -1531,11 +1746,17 @@ class DynamicBlockWrapper(torch.utils.data.Dataset):
                 # sequential fallback with requested block count
                 sequential = self._sequential_partitions(num_atoms, num_part)
                 if sequential:
-                    frag = fragment_smiles_for_partitions(mol, sequential)
-                    if self._fragments_valid(frag, min_atoms_local):
-                        sequential = self._merge_small_partitions(mol, sequential, min_atoms_local)
+                    try:
                         frag = fragment_smiles_for_partitions(mol, sequential)
-                    if self._fragments_valid(frag, min_atoms_local):
+                    except Exception:
+                        frag = None
+                    if frag is not None and self._fragments_valid(frag, min_atoms_local):
+                        sequential = self._merge_small_partitions(mol, sequential, min_atoms_local)
+                        try:
+                            frag = fragment_smiles_for_partitions(mol, sequential)
+                        except Exception:
+                            frag = None
+                    if frag is not None and self._fragments_valid(frag, min_atoms_local):
                         return sequential, frag
             finally:
                 self._min_fragment_atoms_value = prev_min
